@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM Usage Dashboard — AI Talent Management</title>
+  <meta name="description" content="Monitor and control LLM token usage across AI Talent Management, GoClaw, and N8N workflows" />
+  <meta name="robots" content="noindex, nofollow" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- Chart.js with SRI -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+    integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+    crossorigin="anonymous"></script>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════
+     LOGIN SCREEN
+════════════════════════════════════════════════════════════ -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="login-logo-icon">⚡</div>
+      <div>
+        <h1>LLM Usage Dashboard</h1>
+        <p>AI Talent Management</p>
+      </div>
+    </div>
+
+    <div id="login-error" class="login-error"></div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label class="form-label" for="login-email">Email</label>
+        <input id="login-email" type="email" class="form-control" placeholder="your@lintasarta.co.id" required autocomplete="email" />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="login-password">Password</label>
+        <input id="login-password" type="password" class="form-control" placeholder="••••••••" required autocomplete="current-password" />
+      </div>
+      <button id="login-btn" type="submit" class="btn btn-primary w-full" style="justify-content:center; margin-top:8px;">
+        Sign In
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MAIN APP
+════════════════════════════════════════════════════════════ -->
+<div id="app" style="display:none">
+
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <div class="sidebar-logo-icon">⚡</div>
+      <div>
+        <div class="sidebar-logo-text">LLM Dashboard</div>
+        <div class="sidebar-logo-sub">AI Talent Management</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav" id="sidebar-nav">
+      <!-- Admin nav items rendered by JS based on role -->
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="user-card" id="user-card">
+        <div class="user-avatar" id="user-avatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="user-name-display">Loading…</div>
+          <div class="user-role" id="user-role-display"></div>
+        </div>
+        <button class="logout-btn" id="logout-btn" title="Sign out">⏏</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    <div class="topbar">
+      <div>
+        <div class="topbar-title" id="page-title">Overview</div>
+        <div class="topbar-sub" id="page-sub">LLM token usage monitoring</div>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-ghost btn-sm" id="refresh-btn" title="Refresh">↻ Refresh</button>
+        <button class="btn btn-ghost btn-sm" id="lang-toggle">🇬🇧 EN</button>
+      </div>
+    </div>
+
+    <div class="page-content" id="page-content">
+      <!-- Page content rendered by router -->
+    </div>
+  </main>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MODAL CONTAINER
+════════════════════════════════════════════════════════════ -->
+<div id="modal-overlay" class="modal-overlay">
+  <div class="modal" id="modal-box">
+    <div class="modal-header">
+      <div class="modal-title" id="modal-title">Modal</div>
+      <button class="modal-close" id="modal-close">✕</button>
+    </div>
+    <div id="modal-body"></div>
+    <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TOAST CONTAINER
+════════════════════════════════════════════════════════════ -->
+<div id="toast-container"></div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SCRIPTS
+════════════════════════════════════════════════════════════ -->
+<script src="i18n.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>

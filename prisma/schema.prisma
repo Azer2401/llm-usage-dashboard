@@ -1,0 +1,179 @@
+// ============================================================
+// Prisma Schema — LLM Usage Dashboard
+// Standalone project connecting to AITM's ai_talent_db
+// Manages only llm_* tables (does not touch existing AITM tables)
+// ============================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x", "linux-musl", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── LLM Token Plans ──────────────────────────────────────────────────────────
+// Recurring quota plans (MONTHLY or YEARLY)
+model LlmTokenPlan {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  quotaType   String   // MONTHLY | YEARLY
+  quotaTokens BigInt
+  priceAmount BigInt   @default(0)
+  currency    String   @default("IDR")
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  assignments LlmPlanAssignment[]
+
+  @@map("llm_token_plans")
+}
+
+// ─── Plan Assignments ─────────────────────────────────────────────────────────
+// Links a user to an active recurring plan
+model LlmPlanAssignment {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  planId    String    @map("plan_id")
+  startsAt  DateTime  @map("starts_at")
+  resetAt   DateTime  @map("reset_at")
+  isActive  Boolean   @default(true) @map("is_active")
+  endedAt   DateTime? @map("ended_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  plan LlmTokenPlan @relation(fields: [planId], references: [id])
+
+  @@index([userId, isActive])
+  @@map("llm_plan_assignments")
+}
+
+// ─── One-Time Quota Bundles ───────────────────────────────────────────────────
+model LlmQuotaBundle {
+  id              String    @id @default(uuid())
+  userId          String    @map("user_id")
+  quotaTokens     BigInt    @map("quota_tokens")
+  remainingTokens BigInt    @map("remaining_tokens")
+  expiresAt       DateTime? @map("expires_at")
+  note            String?
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("llm_quota_bundles")
+}
+
+// ─── Usage Events Ledger (Source of Truth) ────────────────────────────────────
+model LlmUsageEvent {
+  id               String   @id @default(uuid())
+  userId           String   @map("user_id")
+  sourceService    String   @map("source_service")   // BACKEND | N8N | GOCLAW
+  featureName      String?  @map("feature_name")     // n8n_scout, cv_parsing, etc.
+  workflowName     String?  @map("workflow_name")
+  executionId      String?  @map("execution_id")
+  requestId        String?  @unique @map("request_id")
+  modelName        String?  @map("model_name")       // null for API-only services
+  providerName     String?  @map("provider_name")
+  promptTokens     BigInt   @default(0) @map("prompt_tokens")
+  completionTokens BigInt   @default(0) @map("completion_tokens")
+  totalTokens      BigInt   @default(0) @map("total_tokens")
+  costAmount       Decimal  @default(0) @map("cost_amount") @db.Decimal(10, 6)
+  costCurrency     String   @default("USD") @map("cost_currency")
+  status           String   // SUCCESS | FAILED | REJECTED
+  latencyMs        Int?     @map("latency_ms")
+  quotaSource      String?  @map("quota_source")    // RECURRING | BUNDLE
+  metadataJson     Json?    @map("metadata_json")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([sourceService, createdAt])
+  @@index([status, createdAt])
+  @@index([featureName, createdAt])
+  @@map("llm_usage_events")
+}
+
+// ─── Daily Aggregates ────────────────────────────────────────────────────────
+model LlmUsageDailyAggregate {
+  id            String   @id @default(uuid())
+  userId        String   @map("user_id")
+  date          DateTime @db.Date
+  sourceService String   @map("source_service")
+  featureName   String?  @map("feature_name")
+  totalTokens   BigInt   @default(0) @map("total_tokens")
+  totalCost     Decimal  @default(0) @map("total_cost") @db.Decimal(10, 6)
+  successCount  Int      @default(0) @map("success_count")
+  failedCount   Int      @default(0) @map("failed_count")
+  rejectedCount Int      @default(0) @map("rejected_count")
+
+  @@unique([userId, date, sourceService, featureName])
+  @@index([date])
+  @@map("llm_usage_daily_aggregates")
+}
+
+// ─── User Mapping: AITM ↔ GoClaw WhatsApp ────────────────────────────────────
+// Admin manually links HR users to their GoClaw WhatsApp sender_id
+model LlmUserMapping {
+  id                String   @id @default(uuid())
+  userId            String   @unique @map("user_id")  // AITM users.id
+  goclawSenderId    String?  @map("goclaw_sender_id") // GoClaw channel_contacts.sender_id
+  goclawDisplayName String?  @map("goclaw_display_name")
+  matchConfidence   String   @default("manual") @map("match_confidence") // auto | manual | unmatched
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_user_mappings")
+}
+
+// ─── Service Registry ────────────────────────────────────────────────────────
+// Tracks external services (N8N workflows, MCPs) and their pricing
+model LlmServiceRegistry {
+  id             String   @id @default(uuid())
+  serviceName    String   @unique @map("service_name") // n8n-scout, n8n-cv-parser, etc.
+  sourceService  String   @map("source_service")       // N8N | GOCLAW | BACKEND
+  displayName    String   @map("display_name")
+  description    String?
+  costPerHit     Decimal  @default(0) @map("cost_per_hit") @db.Decimal(10, 6)
+  costCurrency   String   @default("USD") @map("cost_currency")
+  // Scout-specific: hit-based limits
+  hitLimitMonthly Int?    @map("hit_limit_monthly")   // max hits/month per user
+  // Cost-based limits
+  costLimitMonthly Decimal? @map("cost_limit_monthly") @db.Decimal(10, 2) // max cost/month per user
+  isActive       Boolean  @default(true) @map("is_active")
+  pricingDetails Json?    @map("pricing_details")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_service_registry")
+}
+
+// ─── Internal Service Auth Keys ───────────────────────────────────────────────
+model LlmInternalServiceKey {
+  id          String   @id @default(uuid())
+  serviceName String   @map("service_name") // n8n | goclaw | backend
+  keyHash     String   @map("key_hash")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_internal_service_keys")
+}
+
+// ─── Audit Log ───────────────────────────────────────────────────────────────
+model LlmAuditLog {
+  id          String   @id @default(uuid())
+  actorUserId String   @map("actor_user_id")
+  action      String   // plan.create | plan.update | plan.assign | bundle.add | mapping.update
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id")
+  beforeJson  Json?    @map("before_json")
+  afterJson   Json?    @map("after_json")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([actorUserId, createdAt])
+  @@index([targetType, targetId])
+  @@map("llm_audit_logs")
+}

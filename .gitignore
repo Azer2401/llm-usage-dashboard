@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment (contains secrets)
+.env
+
+# Prisma generated client
+prisma/generated/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

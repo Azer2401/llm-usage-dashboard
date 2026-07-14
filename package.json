@@ -1,0 +1,26 @@
+{
+  "name": "llm-usage-dashboard",
+  "version": "1.0.0",
+  "description": "LLM Token Usage Monitoring & Control Dashboard for AI Talent Management + GoClaw",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "setup": "node scripts/setup.js",
+    "migrate": "npx prisma migrate deploy",
+    "migrate:dev": "npx prisma migrate dev",
+    "generate": "npx prisma generate",
+    "seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.3",
+    "prisma": "^5.22.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -2,7 +2,7 @@
 
 const { Router } = require('express');
 const { requireAuth, requireHRorHM } = require('../auth');
-const { aitmPool } = require('../db');
+const { dashboardPool } = require('../db');
 const { getUserQuotaSummary } = require('../services/quota');
 
 const router = Router();
@@ -16,7 +16,7 @@ router.get('/summary', async (req, res) => {
 
     // Usage this period
     const periodFrom = summary.assignment?.starts_at || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-    const usageRes = await aitmPool.query(`
+    const usageRes = await dashboardPool.query(`
       SELECT
         COALESCE(SUM(total_tokens), 0)                               AS total_tokens,
         COUNT(*) FILTER (WHERE status = 'SUCCESS')                   AS successful_requests,
@@ -90,7 +90,7 @@ router.get('/events', async (req, res) => {
     if (status)        { params.push(status);        conditions.push(`status = $${params.length}`); }
     const whereExtra = conditions.length ? 'AND ' + conditions.join(' AND ') : '';
 
-    const { rows } = await aitmPool.query(`
+    const { rows } = await dashboardPool.query(`
       SELECT id, source_service, feature_name, workflow_name, model_name,
              prompt_tokens, completion_tokens, total_tokens, cost_amount,
              status, latency_ms, created_at
@@ -99,7 +99,7 @@ router.get('/events', async (req, res) => {
       ORDER BY created_at DESC LIMIT $4 OFFSET $5
     `, params);
 
-    const countRes = await aitmPool.query(`
+    const countRes = await dashboardPool.query(`
       SELECT COUNT(*) AS total FROM llm_usage_events
       WHERE user_id = $1 AND created_at BETWEEN $2 AND $3 ${whereExtra}
     `, params.slice(0, 3 + conditions.length));
@@ -122,7 +122,7 @@ router.get('/events', async (req, res) => {
 router.get('/plan', async (req, res) => {
   try {
     const userId = req.user.id;
-    const { rows } = await aitmPool.query(`
+    const { rows } = await dashboardPool.query(`
       SELECT a.id, a.plan_id, p.name, p.quota_type, p.quota_tokens, a.starts_at, a.reset_at
       FROM llm_plan_assignments a
       JOIN llm_token_plans p ON p.id = a.plan_id
@@ -138,7 +138,7 @@ router.get('/plan', async (req, res) => {
 router.get('/bundles', async (req, res) => {
   try {
     const userId = req.user.id;
-    const { rows } = await aitmPool.query(`
+    const { rows } = await dashboardPool.query(`
       SELECT id, quota_tokens, remaining_tokens, expires_at, note, created_at,
              CASE
                WHEN remaining_tokens = 0 THEN 'EXHAUSTED'

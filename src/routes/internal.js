@@ -2,7 +2,7 @@
 
 const { Router } = require('express');
 const { requireInternalKey } = require('../auth');
-const { aitmPool } = require('../db');
+const { dashboardPool, aitmPool } = require('../db');
 const { preflightCheck, deductQuota, checkServiceLimits } = require('../services/quota');
 
 const router = Router();
@@ -35,7 +35,7 @@ router.post('/preflight', async (req, res) => {
       const serviceLimitCheck = await checkServiceLimits(userId, featureName);
       if (serviceLimitCheck.exceeded) {
         // Record rejection event
-        await aitmPool.query(`
+        await dashboardPool.query(`
           INSERT INTO llm_usage_events (id, user_id, source_service, feature_name, workflow_name, execution_id,
             model_name, prompt_tokens, completion_tokens, total_tokens, cost_amount, status, metadata_json, created_at)
           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 0, 0, 0, 0, 'REJECTED', $7, NOW())
@@ -55,7 +55,7 @@ router.post('/preflight', async (req, res) => {
 
     if (!result.allowed) {
       // Record rejection event
-      await aitmPool.query(`
+      await dashboardPool.query(`
         INSERT INTO llm_usage_events (id, user_id, source_service, feature_name, workflow_name, execution_id,
           model_name, prompt_tokens, completion_tokens, total_tokens, cost_amount, status, metadata_json, created_at)
         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 0, 0, 0, 0, 'REJECTED', $7, NOW())
@@ -85,7 +85,7 @@ router.post('/events', async (req, res) => {
       userId, sourceService, featureName, workflowName,
       executionId, requestId, modelName, providerName,
       promptTokens = 0, completionTokens = 0, totalTokens = 0,
-      costAmount = 0, costCurrency = 'USD',
+      costAmount = 0, costCurrency = 'IDR',
       status, latencyMs, metadata,
     } = req.body;
 
@@ -94,7 +94,7 @@ router.post('/events', async (req, res) => {
 
     // Idempotency check
     if (requestId) {
-      const existing = await aitmPool.query(`SELECT id FROM llm_usage_events WHERE request_id = $1`, [requestId]);
+      const existing = await dashboardPool.query(`SELECT id FROM llm_usage_events WHERE request_id = $1`, [requestId]);
       if (existing.rows.length > 0) {
         return res.json({ id: existing.rows[0].id, status: 'DUPLICATE_IGNORED' });
       }
@@ -105,7 +105,7 @@ router.post('/events', async (req, res) => {
       return res.status(403).json({ error: 'Source service mismatch', code: 'LLM_SOURCE_SERVICE_MISMATCH' });
     }
 
-    const client = await aitmPool.connect();
+    const client = await dashboardPool.connect();
     try {
       await client.query('BEGIN');
 

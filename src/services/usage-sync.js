@@ -1,6 +1,6 @@
 'use strict';
 
-const { aitmPool, goclawPool } = require('../db');
+const { dashboardPool, goclawPool } = require('../db');
 
 // ─── GoClaw Traces → llm_usage_events Sync ───────────────────────────────────
 /**
@@ -14,12 +14,12 @@ async function syncGoclawTraces() {
     goclawClient = await goclawPool.connect();
   } catch (err) {
     console.warn('[Sync] GoClaw DB not available — skipping sync:', err.message);
-    return { synced: 0, skipped: 0 };
+    return { synced: 0, skipped: 0, spans: 0 };
   }
 
   try {
     // Get last sync timestamp from audit log
-    const lastSyncRes = await aitmPool.query(`
+    const lastSyncRes = await dashboardPool.query(`
       SELECT MAX(created_at) AS last_sync
       FROM llm_usage_events
       WHERE source_service = 'GOCLAW'
@@ -48,11 +48,11 @@ async function syncGoclawTraces() {
       LIMIT 500
     `, [lastSync]);
 
-    if (traces.length === 0) return { synced: 0, skipped: 0 };
+    if (traces.length === 0) return { synced: 0, skipped: 0, spans: 0 };
 
     // Build sender_id → AITM user_id map
     const senderIds = [...new Set(traces.map(t => t.goclaw_sender_id))];
-    const mappingRes = await aitmPool.query(`
+    const mappingRes = await dashboardPool.query(`
       SELECT goclaw_sender_id, user_id
       FROM llm_user_mappings
       WHERE goclaw_sender_id = ANY($1)
@@ -64,6 +64,17 @@ async function syncGoclawTraces() {
 
     let synced = 0;
     let skipped = 0;
+    let spansSynced = 0;
+
+    // Load service pricing for auto-cost calculation
+    const { rows: pricingRows } = await dashboardPool.query(`
+      SELECT service_name, cost_per_hit, pricing_type, cost_currency FROM llm_service_registry WHERE is_active = true
+    `);
+    const pricingMap = {};
+    for (const p of pricingRows) pricingMap[p.service_name] = p;
+
+    // Collect all trace IDs that have mapped users for span sync
+    const traceIdsForSpans = [];
 
     for (const trace of traces) {
       const userId = senderToUser[trace.goclaw_sender_id];
@@ -75,13 +86,13 @@ async function syncGoclawTraces() {
                    : 'SUCCESS';
 
       try {
-        await aitmPool.query(`
+        await dashboardPool.query(`
           INSERT INTO llm_usage_events (
             id, user_id, source_service, feature_name, workflow_name,
             execution_id, prompt_tokens, completion_tokens, total_tokens,
             cost_amount, status, latency_ms, quota_source, metadata_json, created_at
           ) VALUES (
-            gen_random_uuid(), $1, 'GOCLAW', 'goclaw_internal_workflow', $2,
+            gen_random_uuid(), $1, 'GOCLAW', 'goclaw_trace', $2,
             $3, $4, $5, $6,
             0, $7, $8, 'RECURRING', $9, $10
           )
@@ -99,6 +110,7 @@ async function syncGoclawTraces() {
           trace.created_at,
         ]);
         synced++;
+        traceIdsForSpans.push({ traceId: trace.execution_id, userId, createdAt: trace.created_at });
       } catch (err) {
         if (!err.message.includes('unique')) {
           console.error('[Sync] Insert error:', err.message);
@@ -107,8 +119,104 @@ async function syncGoclawTraces() {
       }
     }
 
-    console.log(`[Sync] GoClaw traces synced: ${synced} new, ${skipped} skipped`);
-    return { synced, skipped };
+    // ── Sync individual spans (tool_call + llm_call) for mapped traces ──
+    if (traceIdsForSpans.length > 0) {
+      const traceIdList = traceIdsForSpans.map(t => t.traceId);
+      const traceUserMap = {};
+      for (const t of traceIdsForSpans) traceUserMap[t.traceId] = t.userId;
+
+      const { rows: spans } = await goclawClient.query(`
+        SELECT
+          s.id::text AS span_id,
+          s.trace_id::text AS trace_id,
+          s.span_type,
+          s.name AS span_name,
+          s.tool_name,
+          s.model,
+          s.provider,
+          s.input_tokens,
+          s.output_tokens,
+          COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0) AS total_tokens,
+          s.total_cost,
+          s.duration_ms,
+          s.status,
+          s.input_preview,
+          s.output_preview,
+          s.created_at
+        FROM spans s
+        WHERE s.trace_id::text = ANY($1)
+          AND s.span_type IN ('tool_call', 'llm_call')
+        ORDER BY s.created_at ASC
+      `, [traceIdList]);
+
+      for (const span of spans) {
+        const userId = traceUserMap[span.trace_id];
+        if (!userId) continue;
+
+        // Determine feature_name based on span type
+        const featureName = span.span_type === 'tool_call'
+          ? (span.tool_name || span.span_name || 'unknown_tool')
+          : 'llm_call';
+
+        const spanStatus = span.status === 'completed' || span.status === 'ok' ? 'SUCCESS'
+                         : span.status === 'error' ? 'FAILED'
+                         : 'SUCCESS';
+
+        // Use span_id as request_id for idempotency
+        try {
+          await dashboardPool.query(`
+            INSERT INTO llm_usage_events (
+              id, user_id, source_service, feature_name, workflow_name,
+              execution_id, request_id, model_name, provider_name,
+              prompt_tokens, completion_tokens, total_tokens,
+              cost_amount, cost_currency, status, latency_ms, quota_source, metadata_json, created_at
+            ) VALUES (
+              gen_random_uuid(), $1, 'GOCLAW', $2, $3,
+              $4, $5, $6, $7,
+              $8, $9, $10,
+              $11, $12, $13, $14, 'NONE', $15, $16
+            )
+            ON CONFLICT (request_id) DO NOTHING
+          `, [
+            userId,
+            featureName,
+            span.span_type,
+            span.trace_id,          // execution_id = parent trace
+            `span:${span.span_id}`, // request_id for dedup
+            span.model || null,
+            span.provider || null,
+            span.input_tokens || 0,
+            span.output_tokens || 0,
+            span.total_tokens || 0,
+            (() => {
+              const pricing = pricingMap[featureName];
+              if (!pricing) return parseFloat(span.total_cost || 0);
+              if (pricing.pricing_type === 'per_1k_tokens') return ((span.total_tokens || 0) / 1000.0) * parseFloat(pricing.cost_per_hit);
+              return parseFloat(pricing.cost_per_hit);
+            })(),
+            pricingMap[featureName] ? pricingMap[featureName].cost_currency : 'IDR',
+            spanStatus,
+            span.duration_ms || 0,
+            JSON.stringify({
+              spanType: span.span_type,
+              spanName: span.span_name,
+              toolName: span.tool_name,
+              inputPreview: span.input_preview?.slice(0, 200),
+              outputPreview: span.output_preview?.slice(0, 200),
+            }),
+            span.created_at,
+          ]);
+          spansSynced++;
+        } catch (err) {
+          if (!err.message.includes('unique')) {
+            console.error('[Sync] Span insert error:', err.message);
+          }
+        }
+      }
+    }
+
+    console.log(`[Sync] GoClaw traces synced: ${synced} new, ${skipped} skipped, ${spansSynced} spans`);
+    return { synced, skipped, spans: spansSynced };
   } finally {
     goclawClient.release();
   }
@@ -121,7 +229,7 @@ async function computeDailyAggregates(date) {
   const nextDate = new Date(targetDate);
   nextDate.setDate(nextDate.getDate() + 1);
 
-  const { rows } = await aitmPool.query(`
+  const { rows } = await dashboardPool.query(`
     SELECT
       user_id,
       source_service,
@@ -137,7 +245,7 @@ async function computeDailyAggregates(date) {
   `, [targetDate, nextDate]);
 
   for (const row of rows) {
-    await aitmPool.query(`
+    await dashboardPool.query(`
       INSERT INTO llm_usage_daily_aggregates
         (id, user_id, date, source_service, feature_name, total_tokens, total_cost,
          success_count, failed_count, rejected_count)

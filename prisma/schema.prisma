@@ -19,12 +19,12 @@ datasource db {
 model LlmTokenPlan {
   id          String   @id @default(uuid())
   name        String   @unique
-  quotaType   String   // MONTHLY | YEARLY
-  quotaTokens BigInt
-  priceAmount BigInt   @default(0)
+  quotaType   String   @map("quota_type") // MONTHLY | YEARLY
+  quotaTokens BigInt   @map("quota_tokens")
+  priceAmount BigInt   @default(0) @map("price_amount")
   currency    String   @default("IDR")
   description String?
-  isActive    Boolean  @default(true)
+  isActive    Boolean  @default(true) @map("is_active")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
@@ -37,8 +37,9 @@ model LlmTokenPlan {
 // Links a user to an active recurring plan
 model LlmPlanAssignment {
   id        String    @id @default(uuid())
-  userId    String    @map("user_id")
+  userId    String?   @map("user_id")
   planId    String    @map("plan_id")
+  companyId String?   @map("company_id")
   startsAt  DateTime  @map("starts_at")
   resetAt   DateTime  @map("reset_at")
   isActive  Boolean   @default(true) @map("is_active")
@@ -56,6 +57,7 @@ model LlmPlanAssignment {
 model LlmQuotaBundle {
   id              String    @id @default(uuid())
   userId          String    @map("user_id")
+  companyId       String?   @map("company_id")
   quotaTokens     BigInt    @map("quota_tokens")
   remainingTokens BigInt    @map("remaining_tokens")
   expiresAt       DateTime? @map("expires_at")
@@ -119,6 +121,7 @@ model LlmUsageDailyAggregate {
 model LlmUserMapping {
   id                String   @id @default(uuid())
   userId            String   @unique @map("user_id")  // AITM users.id
+  companyId         String?  @map("company_id")
   goclawSenderId    String?  @map("goclaw_sender_id") // GoClaw channel_contacts.sender_id
   goclawDisplayName String?  @map("goclaw_display_name")
   matchConfidence   String   @default("manual") @map("match_confidence") // auto | manual | unmatched
@@ -126,6 +129,31 @@ model LlmUserMapping {
   updatedAt         DateTime @updatedAt @map("updated_at")
 
   @@map("llm_user_mappings")
+}
+
+// ─── Company Accounts ────────────────────────────────────────────────────────
+model LlmCompany {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_companies")
+}
+
+// ─── Plan Services ────────────────────────────────────────────────────────────
+model LlmPlanService {
+  id               String   @id @default(uuid())
+  planId           String   @map("plan_id")
+  serviceId        String   @map("service_id")
+  hitLimitMonthly  Int?     @map("hit_limit_monthly")
+  costLimitMonthly Decimal? @map("cost_limit_monthly") @db.Decimal(10, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_plan_services")
 }
 
 // ─── Service Registry ────────────────────────────────────────────────────────
@@ -136,6 +164,7 @@ model LlmServiceRegistry {
   sourceService  String   @map("source_service")       // N8N | GOCLAW | BACKEND
   displayName    String   @map("display_name")
   description    String?
+  pricingType    String?  @map("pricing_type")
   costPerHit     Decimal  @default(0) @map("cost_per_hit") @db.Decimal(10, 6)
   costCurrency   String   @default("USD") @map("cost_currency")
   // Scout-specific: hit-based limits

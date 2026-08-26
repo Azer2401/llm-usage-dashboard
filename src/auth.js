@@ -5,8 +5,9 @@ const { aitmPool } = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwt';
 
-// ─── HR/HM role check ────────────────────────────────────────────────────────
-const MONITORED_ROLES = ['HUMAN RESOURCES', 'HIRING MANAGER'];
+// ─── Role definitions ─────────────────────────────────────────────────────────
+const ADMIN_ROLE      = 'ADMIN';
+const MONITORED_ROLES = ['ADMIN', 'HUMAN RESOURCES', 'HIRING MANAGER'];
 
 function isMonitoredRole(role) {
   return MONITORED_ROLES.includes(role);
@@ -43,11 +44,11 @@ function requireHRorHM(req, res, next) {
   next();
 }
 
-// ─── Middleware: Require HUMAN RESOURCES role (admin-level for this dashboard) ─
-// In this system, HR acts as the admin who manages plans/assignments/mappings
+// ─── Middleware: Require ADMIN role ───────────────────────────────────────────
+// Only ADMIN users can access admin dashboard endpoints
 function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-  if (req.user.role !== 'HUMAN RESOURCES') {
+  if (req.user.role !== ADMIN_ROLE) {
     return res.status(403).json({ error: 'Forbidden', code: 'ADMIN_REQUIRED' });
   }
   next();

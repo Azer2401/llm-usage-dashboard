@@ -19,13 +19,25 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-// ─── AITM DB Pool (ai_talent_db, port 5432) ──────────────────────────────────
+// ─── Dashboard DB Pool (llm_dashboard_db, port 5434) ─────────────────────────
+const dashboardPool = new Pool({
+  host:     process.env.DASHBOARD_DB_HOST     || 'localhost',
+  port:     parseInt(process.env.DASHBOARD_DB_PORT || '5434', 10),
+  database: process.env.DASHBOARD_DB_NAME     || 'llm_dashboard_db',
+  user:     process.env.DASHBOARD_DB_USER     || 'llm_user',
+  password: process.env.DASHBOARD_DB_PASSWORD || 'llmdevops2026',
+  max: 15,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+// ─── AITM DB Pool (n8n_db, port 5432 - read-only for users/roles) ───────────
 const aitmPool = new Pool({
   host:     process.env.AITM_DB_HOST     || 'localhost',
   port:     parseInt(process.env.AITM_DB_PORT || '5432', 10),
-  database: process.env.AITM_DB_NAME     || 'ai_talent_db',
-  user:     process.env.AITM_DB_USER     || 'postgres',
-  password: process.env.AITM_DB_PASSWORD || 'postgres',
+  database: process.env.AITM_DB_NAME     || 'n8n_db',
+  user:     process.env.AITM_DB_USER     || 'n8n_user',
+  password: process.env.AITM_DB_PASSWORD || 'n8ndevops',
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
@@ -44,6 +56,10 @@ const goclawPool = new Pool({
 });
 
 // Log connection errors without crashing
+dashboardPool.on('error', (err) => {
+  console.error('[Dashboard DB] Unexpected client error:', err.message);
+});
+
 aitmPool.on('error', (err) => {
   console.error('[AITM DB] Unexpected client error:', err.message);
 });
@@ -54,8 +70,14 @@ goclawPool.on('error', (err) => {
 
 async function testConnections() {
   try {
+    await dashboardPool.query('SELECT 1');
+    console.log('[DB] ✅ Dashboard database connected (llm_dashboard_db:5434)');
+  } catch (err) {
+    console.error('[DB] ❌ Dashboard database connection failed:', err.message);
+  }
+  try {
     await aitmPool.query('SELECT 1');
-    console.log('[DB] ✅ AITM database connected (ai_talent_db:5432)');
+    console.log('[DB] ✅ AITM database connected (n8n_db:5432)');
   } catch (err) {
     console.error('[DB] ❌ AITM database connection failed:', err.message);
   }
@@ -67,4 +89,5 @@ async function testConnections() {
   }
 }
 
-module.exports = { aitmPool, goclawPool, testConnections };
+module.exports = { dashboardPool, aitmPool, goclawPool, testConnections };
+

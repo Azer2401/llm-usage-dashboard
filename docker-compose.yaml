@@ -1,0 +1,22 @@
+services:
+  llm-dashboard-pg:
+    image: postgres:15-alpine
+    container_name: llm-dashboard-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: llm_dashboard_db
+      POSTGRES_USER: llm_user
+      POSTGRES_PASSWORD: llmdevops2026
+    ports:
+      - "5434:5432"
+    volumes:
+      - llm_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llm_user -d llm_dashboard_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  llm_pg_data:
+    driver: local

@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { aitmPool } = require('../db');
+const { dashboardPool, aitmPool } = require('../db');
 
 const GOCLAW_PID    = parseInt(process.env.GOCLAW_PID || '0', 10);
 const GOCLAW_CONFIG = process.env.GOCLAW_CONFIG_PATH || '/home/devops/apps/config.json';
@@ -33,13 +33,13 @@ function reloadGoclaw() {
   }
 }
 
+const { getUserQuotaSummary, checkServiceLimits } = require('./quota');
+
 // ─── Main throttle check ──────────────────────────────────────────────────────
 /**
  * Runs the unified throttle check for ALL limit types:
- * - Token quota (recurring plan exhausted)
- * - Bundle quota (all bundles exhausted)
- * - N8N Scout hit count limit
- * - N8N Scout cost limit
+ * - Token quota (recurring plan exhausted OR bundle quota exhausted)
+ * - Service-specific hit count OR cost limits (e.g. N8N Scout)
  *
  * When ANY limit is exceeded, reduces the user's GoClaw message request quota
  * in config.json and sends SIGHUP. Auto-restores when limits are clear.
@@ -47,42 +47,30 @@ function reloadGoclaw() {
 async function runThrottleCheck() {
   const actions = [];
 
-  // ── Get all HR/HM users with plan assignments ──────────────────────────────
-  const { rows: users } = await aitmPool.query(`
+  const DEFAULT_THROTTLE_LIMIT = parseInt(process.env.DEFAULT_THROTTLE_REQUEST_LIMIT || '1', 10);
+
+  // ── Get all HR/HM users from AITM DB ─────────────────────────────────────────
+  const { rows: aitmUsers } = await aitmPool.query(`
     SELECT
       u.id AS user_id,
       u.name,
       u.email,
-      ur.role_name AS role,
-      -- Mapping to GoClaw WhatsApp sender_id
-      m.goclaw_sender_id,
-      -- Active plan quota
-      a.id AS assignment_id,
-      a.starts_at,
-      a.reset_at,
-      p.quota_tokens AS plan_quota,
-      p.quota_type,
-      -- Throttle settings
-      COALESCE(
-        (SELECT throttle_request_limit FROM user_token_limits WHERE user_id = m.goclaw_sender_id),
-        1
-      ) AS throttle_req_limit,
-      COALESCE(
-        (SELECT original_request_limit FROM user_token_limits WHERE user_id = m.goclaw_sender_id),
-        20
-      ) AS original_req_limit,
-      COALESCE(
-        (SELECT warning_threshold_pct FROM user_token_limits WHERE user_id = m.goclaw_sender_id),
-        80
-      ) AS warning_pct
+      ur.role_name AS role
     FROM users u
     JOIN employees e ON e.user_id = u.id
     JOIN user_roles ur ON ur.id = e.user_role_id
-    LEFT JOIN llm_user_mappings m ON m.user_id = u.id
-    LEFT JOIN llm_plan_assignments a ON a.user_id = u.id AND a.is_active = true
-    LEFT JOIN llm_token_plans p ON p.id = a.plan_id
     WHERE ur.role_name IN ('HUMAN RESOURCES', 'HIRING MANAGER')
   `);
+
+  // Get mappings from Dashboard DB
+  const { rows: mappings } = await dashboardPool.query(`
+    SELECT user_id, goclaw_sender_id FROM llm_user_mappings WHERE goclaw_sender_id IS NOT NULL
+  `);
+  const mappingMap = new Map(mappings.map(m => [m.user_id, m.goclaw_sender_id]));
+
+  const users = aitmUsers
+    .filter(u => mappingMap.has(u.user_id))
+    .map(u => ({ ...u, goclaw_sender_id: mappingMap.get(u.user_id) }));
 
   // Load GoClaw config
   let config;
@@ -100,77 +88,47 @@ async function runThrottleCheck() {
   let configChanged = false;
 
   for (const user of users) {
-    if (!user.goclaw_sender_id) continue; // No GoClaw mapping — skip throttle
-
     const groupKey = `user:${user.goclaw_sender_id}`;
     const isCurrentlyThrottled = !!config.gateway.quota.groups[groupKey];
     const throttleReasons = [];
 
+    // Get user's quota summary (handles individual and company-level assignments)
+    let quotaSummary;
+    try {
+      quotaSummary = await getUserQuotaSummary(user.user_id);
+    } catch (err) {
+      console.error(`[Throttle] Error getting quota summary for ${user.email}:`, err.message);
+      continue;
+    }
+
     // ── 1. Check token quota ──────────────────────────────────────────────────
-    if (user.assignment_id && user.plan_quota) {
-      const { rows: usageRows } = await aitmPool.query(`
-        SELECT COALESCE(SUM(total_tokens), 0) AS used
-        FROM llm_usage_events
-        WHERE user_id = $1
-          AND status = 'SUCCESS'
-          AND quota_source IN ('RECURRING', 'BOTH')
-          AND created_at >= $2
-          AND created_at < $3
-      `, [user.user_id, user.starts_at, user.reset_at]);
-      const used = BigInt(usageRows[0].used);
-      const quota = BigInt(user.plan_quota);
-      if (used >= quota) {
-        throttleReasons.push(`TOKEN_QUOTA_EXHAUSTED (${used}/${quota})`);
+    if (quotaSummary.totalRemainingTokens <= 0) {
+      if (quotaSummary.assignment) {
+        throttleReasons.push(`TOKEN_QUOTA_EXHAUSTED (used ${quotaSummary.usedRecurringTokens}/${quotaSummary.planQuota})`);
+      } else {
+        throttleReasons.push('NO_ACTIVE_PLAN_OR_QUOTA');
       }
     }
 
-    // ── 2. Check bundle quota ─────────────────────────────────────────────────
-    const { rows: bundles } = await aitmPool.query(`
-      SELECT SUM(remaining_tokens) AS total_remaining
-      FROM llm_quota_bundles
-      WHERE user_id = $1
-        AND remaining_tokens > 0
-        AND (expires_at IS NULL OR expires_at > NOW())
-    `, [user.user_id]);
-    // If they had bundles but now exhausted, and no plan → throttle
-    const { rows: hadBundles } = await aitmPool.query(`
-      SELECT COUNT(*) AS cnt FROM llm_quota_bundles WHERE user_id = $1
-    `, [user.user_id]);
-    const hasBundles = parseInt(hadBundles[0].cnt) > 0;
-    const bundleRemaining = bundles[0].total_remaining ? parseInt(bundles[0].total_remaining) : 0;
-
-    if (hasBundles && bundleRemaining === 0 && !user.assignment_id) {
-      throttleReasons.push('BUNDLE_EXHAUSTED');
-    }
-
-    // ── 3. Check N8N Scout limits ─────────────────────────────────────────────
-    const monthStart = new Date();
-    monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-
-    const { rows: scouts } = await aitmPool.query(`
-      SELECT
-        sr.service_name,
-        sr.hit_limit_monthly,
-        sr.cost_limit_monthly,
-        COUNT(e.id) AS hit_count,
-        COALESCE(SUM(e.cost_amount), 0) AS total_cost
-      FROM llm_service_registry sr
-      LEFT JOIN llm_usage_events e
-        ON e.feature_name = sr.service_name
-        AND e.user_id = $1
-        AND e.status = 'SUCCESS'
-        AND e.created_at >= $2
-      WHERE sr.source_service = 'N8N' AND sr.is_active = true
-      GROUP BY sr.service_name, sr.hit_limit_monthly, sr.cost_limit_monthly
-    `, [user.user_id, monthStart]);
-
-    for (const scout of scouts) {
-      if (scout.hit_limit_monthly && parseInt(scout.hit_count) >= parseInt(scout.hit_limit_monthly)) {
-        throttleReasons.push(`${scout.service_name.toUpperCase()}_HIT_LIMIT (${scout.hit_count}/${scout.hit_limit_monthly} hits)`);
+    // ── 2. Check Service Limits for registered active services ────────────────
+    try {
+      const { rows: activeServices } = await dashboardPool.query(`
+        SELECT service_name, display_name FROM llm_service_registry WHERE is_active = true
+      `);
+      for (const svc of activeServices) {
+        const limitCheck = await checkServiceLimits(user.user_id, svc.service_name);
+        if (limitCheck.exceeded) {
+          for (const reason of limitCheck.reasons) {
+            if (reason.type === 'HIT_LIMIT') {
+              throttleReasons.push(`${svc.display_name.toUpperCase()}_HIT_LIMIT (${reason.hits}/${reason.limit})`);
+            } else if (reason.type === 'COST_LIMIT') {
+              throttleReasons.push(`${svc.display_name.toUpperCase()}_COST_LIMIT ($${reason.totalCost.toFixed(2)}/$${reason.limit.toFixed(2)})`);
+            }
+          }
+        }
       }
-      if (scout.cost_limit_monthly && parseFloat(scout.total_cost) >= parseFloat(scout.cost_limit_monthly)) {
-        throttleReasons.push(`${scout.service_name.toUpperCase()}_COST_LIMIT ($${scout.total_cost}/$${scout.cost_limit_monthly})`);
-      }
+    } catch (err) {
+      console.error(`[Throttle] Error checking service limits for ${user.email}:`, err.message);
     }
 
     const shouldThrottle = throttleReasons.length > 0;
@@ -178,13 +136,13 @@ async function runThrottleCheck() {
     // ── Apply throttle config change ──────────────────────────────────────────
     if (shouldThrottle && !isCurrentlyThrottled) {
       config.gateway.quota.groups[groupKey] = {
-        hour: parseInt(user.throttle_req_limit) || 1,
-        day:  parseInt(user.throttle_req_limit) || 1,
+        hour: DEFAULT_THROTTLE_LIMIT,
+        day:  DEFAULT_THROTTLE_LIMIT,
       };
       configChanged = true;
       actions.push({ userId: user.user_id, senderId: user.goclaw_sender_id, action: 'throttled', reasons: throttleReasons });
 
-      await aitmPool.query(`
+      await dashboardPool.query(`
         INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
         VALUES (gen_random_uuid(), 'system', 'throttle.apply', 'user', $1, $2, NOW())
       `, [user.user_id, JSON.stringify({ reasons: throttleReasons, goclawSenderId: user.goclaw_sender_id })]);
@@ -196,7 +154,7 @@ async function runThrottleCheck() {
       configChanged = true;
       actions.push({ userId: user.user_id, senderId: user.goclaw_sender_id, action: 'restored' });
 
-      await aitmPool.query(`
+      await dashboardPool.query(`
         INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
         VALUES (gen_random_uuid(), 'system', 'throttle.restore', 'user', $1, $2, NOW())
       `, [user.user_id, JSON.stringify({ goclawSenderId: user.goclaw_sender_id })]);

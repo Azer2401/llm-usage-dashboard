@@ -5,9 +5,11 @@
 'use strict';
 
 /* ─── Constants ─────────────────────────────────────────────────────────────── */
-const API_BASE     = window.location.origin;
-const AITM_AUTH_URL = `${API_BASE}/../api/auth/login`; // adjust if AITM runs on different port
-const DIRECT_AUTH   = `${API_BASE}/api/auth/login`;
+// Detect /quota/ subpath when served behind Nginx reverse proxy
+const BASE_PATH    = window.location.pathname.startsWith('/quota') ? '/quota' : '';
+const API_BASE     = window.location.origin + BASE_PATH;
+const AITM_AUTH_URL = `${window.location.origin}/auth/login`; // AITM backend is always at domain root
+const DIRECT_AUTH   = `${window.location.origin}/auth/login`;
 
 /* ─── State ──────────────────────────────────────────────────────────────────── */
 const state = {
@@ -26,11 +28,13 @@ function fmtTokens(n) {
   return num.toLocaleString();
 }
 
-function fmtCost(n, currency = 'USD') {
+function fmtCost(n, currency = 'IDR') {
   if (n === null || n === undefined) return '—';
   const num = parseFloat(n);
-  if (currency === 'USD') return '$' + num.toFixed(num < 0.01 ? 6 : 2);
-  return num.toLocaleString() + ' ' + currency;
+  return 'Rp ' + num.toLocaleString('id-ID', {
+    minimumFractionDigits: num % 1 === 0 ? 0 : 2,
+    maximumFractionDigits: 6
+  });
 }
 
 function fmtDate(d) {
@@ -123,13 +127,17 @@ async function api(method, path, body, opts = {}) {
 const GET    = (p)    => api('GET',    p);
 const POST   = (p, b) => api('POST',   p, b);
 const PATCH  = (p, b) => api('PATCH',  p, b);
+const DEL    = (p)    => api('DELETE', p);
 
 /* ─── Auth ───────────────────────────────────────────────────────────────────── */
 // Login using AITM backend JWT
 async function handleLogin(email, password) {
-  // Try AITM backend API (which may be on port 3000)
-  const aitmPort = 3000;
-  const url = `${window.location.protocol}//${window.location.hostname}:${aitmPort}/api/auth/login`;
+  let url = AITM_AUTH_URL;
+
+  // Fallback for local development testing on port 3003
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    url = `${window.location.protocol}//${window.location.hostname}:3001/auth/login`;
+  }
 
   let data;
   try {
@@ -141,7 +149,23 @@ async function handleLogin(email, password) {
     data = await res.json();
     if (!res.ok) throw new Error(data.message || 'Login failed');
   } catch (err) {
-    throw new Error('Cannot reach AITM backend. Ensure it is running on port 3000.');
+    if (url.includes(':3001')) {
+      // If port 3001 fails, try port 3000 as a last resort
+      try {
+        const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:3000/auth/login`;
+        const res = await fetch(fallbackUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        data = await res.json();
+        if (!res.ok) throw new Error(data.message || 'Login failed');
+      } catch (err2) {
+        throw new Error('Cannot reach AITM backend. Ensure it is running.');
+      }
+    } else {
+      throw new Error(err.message || 'Cannot reach AITM backend.');
+    }
   }
 
   const token = data.access_token;
@@ -149,8 +173,8 @@ async function handleLogin(email, password) {
 
   // Decode payload
   const payload = JSON.parse(atob(token.split('.')[1]));
-  if (!['HUMAN RESOURCES', 'HIRING MANAGER'].includes(payload.role)) {
-    throw new Error('Access denied. This dashboard is for HR and Hiring Managers only.');
+  if (!['ADMIN', 'HUMAN RESOURCES', 'HIRING MANAGER'].includes(payload.role)) {
+    throw new Error('Access denied. This dashboard is for Admin, HR, and Hiring Managers only.');
   }
 
   state.token = token;
@@ -188,11 +212,13 @@ function showApp() {
   document.getElementById('app').style.display = 'flex';
   renderSidebar();
   renderUserCard();
-  router.navigate('overview');
+  // ADMIN → admin overview, HR/HM → personal usage page
+  const defaultPage = state.user?.role === 'ADMIN' ? 'overview' : 'my-usage';
+  router.navigate(defaultPage);
 }
 
 function renderSidebar() {
-  const isAdmin = state.user?.role === 'HUMAN RESOURCES';
+  const isAdmin = state.user?.role === 'ADMIN';
   const nav = document.getElementById('sidebar-nav');
   const adminItems = isAdmin ? `
     <div class="sidebar-section">${t('section_admin')}</div>
@@ -536,15 +562,18 @@ pages.users = async function() {
   let search = '', quotaType = '', skip = 0, take = 20;
 
   content.innerHTML = `
-    <div class="filters-bar">
-      <input id="user-search" type="text" class="form-control" style="flex:1; max-width:300px;"
-        placeholder="${t('search_placeholder')}" value="${search}" />
-      <select id="user-quota-type" class="form-control" style="width:auto; padding:6px 28px 6px 10px; font-size:12px;">
-        <option value="">${t('filter_quota_type')}</option>
-        <option value="MONTHLY">${t('monthly')}</option>
-        <option value="YEARLY">${t('yearly')}</option>
-      </select>
-      <button class="btn btn-ghost btn-sm" id="user-filter-btn">Filter</button>
+    <div class="filters-bar" style="justify-content:space-between;">
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input id="user-search" type="text" class="form-control" style="flex:1; max-width:300px;"
+          placeholder="${t('search_placeholder')}" value="${search}" />
+        <select id="user-quota-type" class="form-control" style="width:auto; padding:6px 28px 6px 10px; font-size:12px;">
+          <option value="">${t('filter_quota_type')}</option>
+          <option value="MONTHLY">${t('monthly')}</option>
+          <option value="YEARLY">${t('yearly')}</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" id="user-filter-btn">Filter</button>
+      </div>
+      <button class="btn btn-primary btn-sm" id="create-user-btn" onclick="showCreateUserModal(pages.users._reload)" style="gap:4px;">➕ Create User</button>
     </div>
 
     <div class="table-wrap">
@@ -568,7 +597,11 @@ pages.users = async function() {
     </div>
   `;
 
+  // Create User button handler
+  document.getElementById('create-user-btn').addEventListener('click', () => showCreateUserModal(loadUsers));
+
   async function loadUsers() {
+    pages.users._reload = loadUsers; // expose for edit/delete callbacks
     const params = new URLSearchParams({ skip, take });
     if (search) params.set('search', search);
     if (quotaType) params.set('quotaType', quotaType);
@@ -608,6 +641,8 @@ pages.users = async function() {
                 <button class="btn btn-xs btn-outline" onclick="pages.users.viewDetail('${u.userId}')">${t('btn_view')}</button>
                 <button class="btn btn-xs btn-ghost" onclick="pages.plans.showAssignModal('${u.userId}', '${u.name}')">${t('btn_assign_plan')}</button>
                 <button class="btn btn-xs btn-ghost" onclick="pages.plans.showBundleModal('${u.userId}', '${u.name}')">${t('btn_add_bundle')}</button>
+                <button class="btn btn-xs btn-ghost" style="color:var(--warning);" onclick="showEditUserModal('${u.userId}', '${u.name}', '${u.email}', '${u.role}', pages.users._reload)">✏️</button>
+                <button class="btn btn-xs btn-ghost" style="color:var(--danger);" onclick="deleteUser('${u.userId}', '${u.name}', pages.users._reload)">🗑️</button>
               </div>
             </td>
           </tr>`;
@@ -818,9 +853,10 @@ async function renderPlansTab(tab) {
         <thead><tr>
           <th>${t('form_plan_name')}</th><th>${t('form_quota_type')}</th>
           <th>${t('col_quota_tokens')}</th><th>${t('col_price')}</th>
+          <th>Services & Limits</th>
           <th>${t('col_assignments')}</th><th>${t('col_active')}</th><th>${t('col_actions')}</th>
         </tr></thead>
-        <tbody id="plans-tbody"><tr><td colspan="7" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+        <tbody id="plans-tbody"><tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
       </table></div>
     `;
     document.getElementById('btn-create-plan').addEventListener('click', () => showCreatePlanModal());
@@ -860,15 +896,28 @@ async function loadPlans() {
   const data = await GET('/api/admin/plans').catch(() => null);
   if (!data) return;
   const tbody = document.getElementById('plans-tbody');
-  tbody.innerHTML = data.items?.length ? data.items.map(p => `<tr>
-    <td style="font-weight:600;">${p.name}</td>
-    <td>${t(p.quota_type?.toLowerCase()) || p.quota_type}</td>
-    <td>${fmtTokens(p.quotaTokens)}</td>
-    <td>${p.price_amount ? fmtCost(p.price_amount/100, p.currency) : '—'}</td>
-    <td><span class="badge badge-healthy">${p.assignmentCount} users</span></td>
-    <td>${p.is_active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Inactive</span>'}</td>
-    <td><button class="btn btn-xs btn-ghost" onclick="showEditPlanModal('${p.id}')">Edit</button></td>
-  </tr>`).join('') : `<tr><td colspan="7" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
+  tbody.innerHTML = data.items?.length ? data.items.map(p => {
+    const servicesHTML = p.services?.length
+      ? p.services.map(s => {
+          let limitStr = [];
+          if (s.hitLimitMonthly) limitStr.push(`${s.hitLimitMonthly} hits`);
+          if (s.costLimitMonthly) limitStr.push(`${fmtCost(s.costLimitMonthly)}`);
+          if (limitStr.length === 0) limitStr.push('Unlimited');
+          return `<div style="font-size:11px; margin-bottom:2px;">• <strong>${s.displayName}</strong>: ${limitStr.join(' / ')}</div>`;
+        }).join('')
+      : '<span class="text-muted text-xs">No service restrictions</span>';
+
+    return `<tr>
+      <td style="font-weight:600;">${p.name}</td>
+      <td>${t(p.quota_type?.toLowerCase()) || p.quota_type}</td>
+      <td>${fmtTokens(p.quotaTokens)}</td>
+      <td>${p.price_amount ? fmtCost(p.price_amount/100, p.currency) : '—'}</td>
+      <td>${servicesHTML}</td>
+      <td><span class="badge badge-healthy">${p.assignmentCount} users</span></td>
+      <td>${p.is_active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Inactive</span>'}</td>
+      <td><button class="btn btn-xs btn-ghost" onclick="showEditPlanModal('${p.id}')">Edit</button></td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
 }
 
 async function loadAssignments() {
@@ -886,94 +935,349 @@ async function loadAssignments() {
   </tr>`).join('') : `<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">No assignments yet.</td></tr>`;
 }
 
-function showCreatePlanModal() {
+async function showCreatePlanModal() {
+  const svcsData = await GET('/api/admin/services').catch(() => ({ items: [] }));
+  const services = svcsData.items || [];
+
+  let servicesHTML = services.length ? services.map(svc => `
+    <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px; border-bottom: 1px solid var(--border); padding-bottom:8px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+         <div style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" class="plan-svc-check" data-id="${svc.id}" style="width:auto;" />
+            <span style="font-weight:600; font-size:13px; color:var(--text-main);">${svc.display_name}</span>
+         </div>
+      </div>
+      <div class="plan-svc-limits-row" id="limits-row-${svc.id}" style="display:none; gap:12px; padding-left:22px; margin-top:4px;">
+         <div style="flex:1;">
+            <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:4px;">Hit Limit/mo</label>
+            <input type="number" class="form-control plan-svc-hits" data-id="${svc.id}" placeholder="Unlimited" style="height:28px; font-size:12px;" />
+         </div>
+         <div style="flex:1;">
+            <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:4px;">Cost Limit/mo (Rp)</label>
+            <input type="number" class="form-control plan-svc-cost" data-id="${svc.id}" placeholder="Unlimited" style="height:28px; font-size:12px;" />
+         </div>
+      </div>
+    </div>
+  `).join('') : '<p class="text-muted text-xs">No registered services found.</p>';
+
   modal.open(t('btn_create_plan'), `
-    <div class="form-group"><label class="form-label">${t('form_plan_name')}</label><input id="mp-name" class="form-control" placeholder="e.g. Monthly Standard" /></div>
+    <div class="form-group"><label class="form-label">${t('form_plan_name')}</label><input id="mp-name" class="form-control" placeholder="e.g. Silver Plan" /></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">${t('form_quota_type')}</label>
         <select id="mp-type" class="form-control"><option value="MONTHLY">${t('monthly')}</option><option value="YEARLY">${t('yearly')}</option></select></div>
-      <div class="form-group"><label class="form-label">${t('form_quota_tokens')}</label><input id="mp-tokens" type="number" class="form-control" placeholder="500000" min="1" /></div>
+      <div class="form-group"><label class="form-label">${t('form_quota_tokens')}</label><input id="mp-tokens" type="number" class="form-control" placeholder="100000000" min="1" /></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Price (Rupiah)</label>
+        <input id="mp-price" type="number" class="form-control" placeholder="e.g. 8000000" min="0" /></div>
+      <div class="form-group"><label class="form-label">Currency</label>
+        <input class="form-control" value="IDR" disabled /></div>
     </div>
     <div class="form-group"><label class="form-label">${t('form_description')}</label><input id="mp-desc" class="form-control" placeholder="Description…" /></div>
+    
+    <div class="form-group">
+      <label class="form-label" style="font-weight:600; margin-bottom:8px; display:block;">Included Services & Limits</label>
+      <div style="border: 1px solid var(--border); border-radius: 6px; padding: 12px; max-height: 250px; overflow-y: auto; background: var(--bg-hover);">
+        ${servicesHTML}
+      </div>
+    </div>
   `, `
     <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
     <button class="btn btn-primary" id="mp-save">${t('save')}</button>
   `);
+
+  document.querySelectorAll('.plan-svc-check').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const limitsRow = document.getElementById(`limits-row-${e.target.dataset.id}`);
+      if (limitsRow) limitsRow.style.display = e.target.checked ? 'flex' : 'none';
+    });
+  });
+
   document.getElementById('mp-save').addEventListener('click', async () => {
     const name = document.getElementById('mp-name').value.trim();
     const quotaType = document.getElementById('mp-type').value;
     const quotaTokens = parseInt(document.getElementById('mp-tokens').value);
+    const priceAmountVal = parseFloat(document.getElementById('mp-price').value) || 0;
     const description = document.getElementById('mp-desc').value.trim();
+
     if (!name || !quotaTokens) return showToast('Name and tokens required', 'error');
+
+    const selectedServices = [];
+    document.querySelectorAll('.plan-svc-check:checked').forEach(cb => {
+      const serviceId = cb.dataset.id;
+      const hitsVal = document.querySelector(`.plan-svc-hits[data-id="${serviceId}"]`).value;
+      const costVal = document.querySelector(`.plan-svc-cost[data-id="${serviceId}"]`).value;
+      selectedServices.push({
+        serviceId,
+        hitLimitMonthly: hitsVal ? parseInt(hitsVal) : null,
+        costLimitMonthly: costVal ? parseFloat(costVal) : null
+      });
+    });
+
     try {
-      await POST('/api/admin/plans', { name, quotaType, quotaTokens, description });
+      await POST('/api/admin/plans', {
+        name,
+        quotaType,
+        quotaTokens,
+        priceAmount: Math.round(priceAmountVal * 100),
+        currency: 'IDR',
+        description,
+        services: selectedServices
+      });
       modal.close(); showToast('Plan created.', 'success');
       renderPlansTab('plans');
     } catch (err) { showToast(err.message, 'error'); }
   });
 }
 
+window.showEditPlanModal = async function(planId) {
+  const [plansData, svcsData] = await Promise.all([
+    GET('/api/admin/plans').catch(() => null),
+    GET('/api/admin/services').catch(() => ({ items: [] }))
+  ]);
+  if (!plansData) return showToast('Failed to load plans', 'error');
+  const plan = plansData.items.find(p => p.id === planId);
+  if (!plan) return showToast('Plan not found', 'error');
+  const services = svcsData.items || [];
+
+  let servicesHTML = services.length ? services.map(svc => {
+    const mapped = plan.services?.find(ps => ps.serviceId === svc.id);
+    const isChecked = !!mapped;
+    const hitLimit = mapped && mapped.hitLimitMonthly !== null && mapped.hitLimitMonthly !== undefined ? mapped.hitLimitMonthly : '';
+    const costLimit = mapped && mapped.costLimitMonthly !== null && mapped.costLimitMonthly !== undefined ? mapped.costLimitMonthly : '';
+
+    return `
+      <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px; border-bottom: 1px solid var(--border); padding-bottom:8px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+           <div style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" class="plan-svc-check" data-id="${svc.id}" ${isChecked ? 'checked' : ''} style="width:auto;" />
+              <span style="font-weight:600; font-size:13px; color:var(--text-main);">${svc.display_name}</span>
+           </div>
+        </div>
+        <div class="plan-svc-limits-row" id="limits-row-${svc.id}" style="display:${isChecked ? 'flex' : 'none'}; gap:12px; padding-left:22px; margin-top:4px;">
+           <div style="flex:1;">
+              <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:4px;">Hit Limit/mo</label>
+              <input type="number" class="form-control plan-svc-hits" data-id="${svc.id}" value="${hitLimit}" placeholder="Unlimited" style="height:28px; font-size:12px;" />
+           </div>
+           <div style="flex:1;">
+              <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:4px;">Cost Limit/mo (Rp)</label>
+              <input type="number" class="form-control plan-svc-cost" data-id="${svc.id}" value="${costLimit}" placeholder="Unlimited" style="height:28px; font-size:12px;" />
+           </div>
+        </div>
+      </div>
+    `;
+  }).join('') : '<p class="text-muted text-xs">No registered services found.</p>';
+
+  modal.open('Edit Plan', `
+    <div class="form-group"><label class="form-label">${t('form_plan_name')}</label>
+      <input id="ep-name" class="form-control" value="${plan.name}" /></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">${t('form_quota_type')}</label>
+        <select id="ep-type" class="form-control" disabled>
+          <option value="MONTHLY" ${plan.quota_type === 'MONTHLY' ? 'selected' : ''}>Monthly</option>
+          <option value="YEARLY" ${plan.quota_type === 'YEARLY' ? 'selected' : ''}>Yearly</option>
+        </select>
+        <span class="text-xs text-muted" style="margin-top:4px; display:block;">Quota type cannot be changed after creation.</span>
+      </div>
+      <div class="form-group"><label class="form-label">${t('form_quota_tokens')}</label>
+        <input id="ep-tokens" type="number" class="form-control" value="${plan.quotaTokens || plan.quota_tokens || 0}" min="1" /></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Price (Rupiah)</label>
+        <input id="ep-price" type="number" class="form-control" value="${plan.price_amount ? (plan.price_amount / 100) : ''}" placeholder="e.g. 8000000" min="0" /></div>
+      <div class="form-group"><label class="form-label">Currency</label>
+        <input class="form-control" value="IDR" disabled /></div>
+    </div>
+    <div class="form-group"><label class="form-label">${t('form_description')}</label>
+      <input id="ep-desc" class="form-control" value="${plan.description || ''}" /></div>
+    <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+      <input id="ep-active" type="checkbox" ${plan.is_active ? 'checked' : ''} style="width:auto;" />
+      <label class="form-label" style="margin:0;" for="ep-active">Active</label>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" style="font-weight:600; margin-bottom:8px; display:block;">Included Services & Limits</label>
+      <div style="border: 1px solid var(--border); border-radius: 6px; padding: 12px; max-height: 250px; overflow-y: auto; background: var(--bg-hover);">
+        ${servicesHTML}
+      </div>
+    </div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="ep-save">${t('save')}</button>
+  `);
+
+  document.querySelectorAll('.plan-svc-check').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const limitsRow = document.getElementById(`limits-row-${e.target.dataset.id}`);
+      if (limitsRow) limitsRow.style.display = e.target.checked ? 'flex' : 'none';
+    });
+  });
+
+  document.getElementById('ep-save').addEventListener('click', async () => {
+    const name = document.getElementById('ep-name').value.trim();
+    const quotaTokens = parseInt(document.getElementById('ep-tokens').value);
+    const priceAmountVal = parseFloat(document.getElementById('ep-price').value) || 0;
+    const description = document.getElementById('ep-desc').value.trim();
+    const isActive = document.getElementById('ep-active').checked;
+
+    if (!name || !quotaTokens || quotaTokens <= 0) return showToast('Name and tokens required', 'error');
+
+    const selectedServices = [];
+    document.querySelectorAll('.plan-svc-check:checked').forEach(cb => {
+      const serviceId = cb.dataset.id;
+      const hitsVal = document.querySelector(`.plan-svc-hits[data-id="${serviceId}"]`).value;
+      const costVal = document.querySelector(`.plan-svc-cost[data-id="${serviceId}"]`).value;
+      selectedServices.push({
+        serviceId,
+        hitLimitMonthly: hitsVal ? parseInt(hitsVal) : null,
+        costLimitMonthly: costVal ? parseFloat(costVal) : null
+      });
+    });
+
+    try {
+      await PATCH(`/api/admin/plans/${planId}`, {
+        name,
+        quotaTokens,
+        priceAmount: Math.round(priceAmountVal * 100),
+        currency: 'IDR',
+        description,
+        isActive,
+        services: selectedServices
+      });
+      modal.close(); showToast('Plan updated.', 'success');
+      renderPlansTab('plans');
+    } catch (err) { showToast(err.message, 'error'); }
+  });
+};
+
 pages.plans.showAssignModal = async function(userId, userName) {
-  // Load users and plans
-  const [usersData, plansData] = await Promise.all([
+  // Load users, companies and plans
+  const [usersData, companiesData, plansData] = await Promise.all([
     GET('/api/admin/users?take=50').catch(() => ({ items: [] })),
+    GET('/api/admin/companies').catch(() => ({ items: [] })),
     GET('/api/admin/plans').catch(() => ({ items: [] })),
   ]);
   const hrUsers = (usersData.items || []).filter(u => u.role !== 'CANDIDATE');
+  const companies = (companiesData.items || []).filter(c => c.is_active);
   const plans = (plansData.items || []).filter(p => p.is_active);
 
-  modal.open(t('btn_assign'), `
-    <div class="form-group"><label class="form-label">${t('form_select_user')}</label>
+  modal.open(t('btn_assign') || 'Assign Plan', `
+    <div class="form-group"><label class="form-label">Assignment Target</label>
+      <select id="as-target-type" class="form-control">
+        <option value="user">Individual User</option>
+        <option value="company">Shared Company Quota</option>
+      </select></div>
+    <div class="form-group" id="as-user-wrap"><label class="form-label">${t('form_select_user') || 'Select User'}</label>
       <select id="as-user" class="form-control">
         ${hrUsers.map(u => `<option value="${u.userId}" ${u.userId === userId ? 'selected' : ''}>${u.name} (${u.role})</option>`).join('')}
       </select></div>
-    <div class="form-group"><label class="form-label">${t('form_select_plan')}</label>
+    <div class="form-group" id="as-company-wrap" style="display:none;"><label class="form-label">Select Company</label>
+      <select id="as-company" class="form-control">
+        ${companies.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+      </select></div>
+    <div class="form-group"><label class="form-label">${t('form_select_plan') || 'Select Plan'}</label>
       <select id="as-plan" class="form-control">
         ${plans.map(p => `<option value="${p.id}">${p.name} (${fmtTokens(p.quotaTokens)} ${p.quota_type})</option>`).join('')}
       </select></div>
-    <div class="quota-banner warning" style="margin-top:8px;">⚠️ ${t('warning_replace_plan')}</div>
+    <div class="quota-banner warning" style="margin-top:8px;">⚠️ ${t('warning_replace_plan') || 'Assigning a new plan will deactivate any active plan for this target.'}</div>
   `, `
     <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
-    <button class="btn btn-primary" id="as-confirm">${t('btn_assign')}</button>
+    <button class="btn btn-primary" id="as-confirm">${t('btn_assign') || 'Assign'}</button>
   `);
+
+  const targetType = document.getElementById('as-target-type');
+  const userWrap = document.getElementById('as-user-wrap');
+  const companyWrap = document.getElementById('as-company-wrap');
+  targetType.addEventListener('change', () => {
+    if (targetType.value === 'user') {
+      userWrap.style.display = 'block';
+      companyWrap.style.display = 'none';
+    } else {
+      userWrap.style.display = 'none';
+      companyWrap.style.display = 'block';
+    }
+  });
+
   document.getElementById('as-confirm').addEventListener('click', async () => {
-    const uid = document.getElementById('as-user').value;
+    const isUser = targetType.value === 'user';
+    const uid = isUser ? document.getElementById('as-user').value : null;
+    const cid = !isUser ? document.getElementById('as-company').value : null;
     const pid = document.getElementById('as-plan').value;
+    
+    if (!pid) return showToast('Please select a plan', 'error');
+    if (isUser && !uid) return showToast('Please select a user', 'error');
+    if (!isUser && !cid) return showToast('Please select a company', 'error');
+
     try {
-      await POST('/api/admin/assignments', { userId: uid, planId: pid });
-      modal.close(); showToast(t('assigned_ok'), 'success');
-    } catch (err) { showToast(t('assigned_err') + ' ' + err.message, 'error'); }
+      await POST('/api/admin/assignments', { userId: uid, companyId: cid, planId: pid });
+      modal.close(); showToast(t('assigned_ok') || 'Plan assigned successfully', 'success');
+      renderPlansTab('assignments');
+    } catch (err) { showToast((t('assigned_err') || 'Assignment failed:') + ' ' + err.message, 'error'); }
   });
 };
 
 pages.plans.showBundleModal = async function(userId, userName) {
-  const usersData = await GET('/api/admin/users?take=50').catch(() => ({ items: [] }));
+  const [usersData, companiesData] = await Promise.all([
+    GET('/api/admin/users?take=50').catch(() => ({ items: [] })),
+    GET('/api/admin/companies').catch(() => ({ items: [] }))
+  ]);
   const hrUsers = (usersData.items || []).filter(u => u.role !== 'CANDIDATE');
+  const companies = (companiesData.items || []).filter(c => c.is_active);
 
-  modal.open(t('btn_add_bundle'), `
-    <div class="form-group"><label class="form-label">${t('form_select_user')}</label>
+  modal.open(t('btn_add_bundle') || 'Add Bundle', `
+    <div class="form-group"><label class="form-label">Bundle Target</label>
+      <select id="bun-target-type" class="form-control">
+        <option value="user">Individual User</option>
+        <option value="company">Shared Company Quota</option>
+      </select></div>
+    <div class="form-group" id="bun-user-wrap"><label class="form-label">${t('form_select_user') || 'Select User'}</label>
       <select id="bun-user" class="form-control">
         ${hrUsers.map(u => `<option value="${u.userId}" ${u.userId === userId ? 'selected' : ''}>${u.name} (${u.role})</option>`).join('')}
       </select></div>
-    <div class="form-group"><label class="form-label">${t('form_quota_tokens_bundle')}</label>
+    <div class="form-group" id="bun-company-wrap" style="display:none;"><label class="form-label">Select Company</label>
+      <select id="bun-company" class="form-control">
+        ${companies.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+      </select></div>
+    <div class="form-group"><label class="form-label">${t('form_quota_tokens_bundle') || 'Bundle Token Quota'}</label>
       <input id="bun-tokens" type="number" class="form-control" placeholder="100000" min="1" /></div>
-    <div class="form-group"><label class="form-label">${t('form_expires_at')}</label>
+    <div class="form-group"><label class="form-label">${t('form_expires_at') || 'Expires At'}</label>
       <input id="bun-exp" type="date" class="form-control" /></div>
-    <div class="form-group"><label class="form-label">${t('form_note')}</label>
+    <div class="form-group"><label class="form-label">${t('form_note') || 'Note'}</label>
       <input id="bun-note" class="form-control" placeholder="Reason for bundle…" /></div>
   `, `
     <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
     <button class="btn btn-primary" id="bun-confirm">Add Bundle</button>
   `);
+
+  const targetType = document.getElementById('bun-target-type');
+  const userWrap = document.getElementById('bun-user-wrap');
+  const companyWrap = document.getElementById('bun-company-wrap');
+  targetType.addEventListener('change', () => {
+    if (targetType.value === 'user') {
+      userWrap.style.display = 'block';
+      companyWrap.style.display = 'none';
+    } else {
+      userWrap.style.display = 'none';
+      companyWrap.style.display = 'block';
+    }
+  });
+
   document.getElementById('bun-confirm').addEventListener('click', async () => {
-    const uid    = document.getElementById('bun-user').value;
+    const isUser = targetType.value === 'user';
+    const uid = isUser ? document.getElementById('bun-user').value : null;
+    const cid = !isUser ? document.getElementById('bun-company').value : null;
     const tokens = parseInt(document.getElementById('bun-tokens').value);
-    const exp    = document.getElementById('bun-exp').value;
-    const note   = document.getElementById('bun-note').value.trim();
-    if (!uid || !tokens || tokens <= 0) return showToast('Select user and enter tokens', 'error');
+    const exp = document.getElementById('bun-exp').value;
+    const note = document.getElementById('bun-note').value.trim();
+
+    if (isUser && !uid) return showToast('Please select a user', 'error');
+    if (!isUser && !cid) return showToast('Please select a company', 'error');
+    if (!tokens || tokens <= 0) return showToast('Please enter a valid token count', 'error');
+
     try {
-      await POST('/api/admin/bundles', { userId: uid, quotaTokens: tokens, expiresAt: exp || null, note });
-      modal.close(); showToast(t('bundle_added'), 'success');
+      await POST('/api/admin/bundles', { userId: uid, companyId: cid, quotaTokens: tokens, expiresAt: exp || null, note });
+      modal.close(); showToast(t('bundle_added') || 'Bundle added successfully', 'success');
+      renderPlansTab('bundles');
     } catch (err) { showToast(err.message, 'error'); }
   });
 };
@@ -983,13 +1287,18 @@ pages.mappings = async function() {
   const content = document.getElementById('page-content');
   content.innerHTML = `
     <div id="mappings-wrap">
+      <div class="section-header">
+        <div class="section-title">User Mapping</div>
+        <button class="btn btn-primary btn-sm" onclick="showAddCompanyModal()">➕ Add Company</button>
+      </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>${t('col_aitm_user')}</th><th>${t('col_role')}</th>
-          <th>${t('col_goclaw_contact')}</th>
-          <th>${t('col_confidence')}</th><th>${t('col_mapped_at')}</th><th>${t('col_actions')}</th>
+          <th>${t('col_aitm_user') || 'AITM User'}</th><th>${t('col_role') || 'Role'}</th>
+          <th>Company</th>
+          <th>${t('col_goclaw_contact') || 'GoClaw Contact'}</th>
+          <th>${t('col_confidence') || 'Confidence'}</th><th>${t('col_mapped_at') || 'Mapped At'}</th><th>${t('col_actions') || 'Actions'}</th>
         </tr></thead>
-        <tbody id="mappings-tbody"><tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+        <tbody id="mappings-tbody"><tr><td colspan="7" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
       </table></div>
     </div>
   `;
@@ -997,8 +1306,13 @@ pages.mappings = async function() {
 };
 
 async function loadMappings() {
-  const data = await GET('/api/admin/mappings').catch(() => null);
+  const [data, companiesData] = await Promise.all([
+    GET('/api/admin/mappings').catch(() => null),
+    GET('/api/admin/companies').catch(() => ({ items: [] }))
+  ]);
   if (!data) return;
+  
+  const companies = companiesData.items || [];
   const tbody = document.getElementById('mappings-tbody');
   tbody.innerHTML = data.items?.length ? data.items.map(m => `<tr>
     <td>
@@ -1006,6 +1320,12 @@ async function loadMappings() {
       <div class="text-xs text-muted">${m.email}</div>
     </td>
     <td class="text-xs text-secondary">${m.role}</td>
+    <td>
+      <select onchange="updateUserCompany('${m.user_id}', this.value)" class="form-control text-xs" style="width: auto; padding: 2px 4px; height: 26px;">
+        <option value="">— No Company —</option>
+        ${companies.map(c => `<option value="${c.id}" ${m.company_id === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+      </select>
+    </td>
     <td>
       ${m.goclaw_sender_id
         ? `<div style="font-size:13px; font-weight:600;">${m.goclaw_display_name || '—'}</div>
@@ -1020,8 +1340,17 @@ async function loadMappings() {
       <button class="btn btn-xs btn-outline" onclick="showMappingModal('${m.user_id}','${m.name}', '${m.goclaw_sender_id || ''}', '${m.goclaw_display_name || ''}')">${t('btn_link')}</button>
       ${m.goclaw_sender_id ? `<button class="btn btn-xs btn-danger" onclick="unlinkMapping('${m.user_id}')" style="margin-left:4px;">${t('btn_unlink')}</button>` : ''}
     </td>
-  </tr>`).join('') : `<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
+  </tr>`).join('') : `<tr><td colspan="7" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
 }
+
+window.updateUserCompany = async function(userId, companyId) {
+  try {
+    await PATCH(`/api/admin/mappings/${userId}/company`, { companyId: companyId || null });
+    showToast('Company mapping updated', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
 
 window.showMappingModal = async function(userId, userName, currentSenderId, currentDisplayName) {
   // Load GoClaw contacts for suggestions
@@ -1080,8 +1409,9 @@ pages.settings = async function() {
   const content = document.getElementById('page-content');
   content.innerHTML = `
     <div class="inner-tabs">
-      <button class="inner-tab active" data-tab="services">${t('tab_services')}</button>
-      <button class="inner-tab" data-tab="audit">${t('tab_audit')}</button>
+      <button class="inner-tab active" data-tab="services">${t('tab_services') || 'Services'}</button>
+      <button class="inner-tab" data-tab="companies">Companies</button>
+      <button class="inner-tab" data-tab="audit">${t('tab_audit') || 'Audit Log'}</button>
     </div>
     <div id="settings-tab-content"></div>
   `;
@@ -1102,15 +1432,19 @@ async function renderSettingsTab(tab) {
     area.innerHTML = `
       <div class="section-header">
         <div class="section-title">Registered Services</div>
-        <button class="btn btn-primary btn-sm" onclick="runThrottleCheck()">▶ ${t('btn_run_throttle')}</button>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-ghost btn-sm" onclick="recalculateCosts()">🔄 Recalculate Costs</button>
+          <button class="btn btn-ghost btn-sm" onclick="runThrottleCheck()">▶ ${t('btn_run_throttle') || 'Run Throttle'}</button>
+          <button class="btn btn-primary btn-sm" onclick="showAddServiceModal()">+ Add Service</button>
+        </div>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>${t('col_service')}</th><th>${t('col_source')}</th>
-          <th>${t('col_cost_per_hit')}</th><th>${t('col_hit_limit')}</th>
-          <th>${t('col_cost_limit')}</th><th>${t('col_active')}</th>
+          <th>${t('col_service') || 'Service'}</th><th>${t('col_source') || 'Source'}</th>
+          <th>Pricing Type</th><th>Cost</th><th>Hit Limit/Mo</th><th>Cost Limit/Mo</th>
+          <th>Status</th><th>Actions</th>
         </tr></thead>
-        <tbody id="services-tbody"><tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+        <tbody id="services-tbody"><tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
       </table></div>
     `;
     const data = await GET('/api/admin/services').catch(() => null);
@@ -1118,11 +1452,44 @@ async function renderSettingsTab(tab) {
       document.getElementById('services-tbody').innerHTML = data.items?.length ? data.items.map(s => `<tr>
         <td><div style="font-weight:600;">${s.display_name}</div><div class="text-xs monospace text-muted">${s.service_name}</div></td>
         <td>${sourceBadge(s.source_service)}</td>
+        <td><span class="badge ${s.pricing_type === 'per_1k_tokens' ? 'badge-backend' : 'badge-frontend'}">${s.pricing_type === 'per_1k_tokens' ? 'Per 1K Tokens' : 'Per Hit'}</span></td>
         <td class="text-sm">${fmtCost(s.cost_per_hit, s.cost_currency)}</td>
         <td class="text-sm">${s.hit_limit_monthly || '—'}</td>
         <td class="text-sm">${s.cost_limit_monthly ? fmtCost(s.cost_limit_monthly, s.cost_currency) : '—'}</td>
         <td>${s.is_active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Off</span>'}</td>
-      </tr>`).join('') : '<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">No services registered.</td></tr>';
+        <td>
+          <div style="display:flex; gap:4px;">
+            <button class="btn btn-ghost btn-sm" onclick="showEditServiceModal('${s.id}')">✏️</button>
+            ${s.is_active ? `<button class="btn btn-ghost btn-sm" onclick="deactivateService('${s.id}', '${s.display_name}')">🚫</button>` : ''}
+          </div>
+        </td>
+      </tr>`).join('') : '<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">No services registered.</td></tr>';
+    }
+  } else if (tab === 'companies') {
+    area.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Companies</div>
+        <button class="btn btn-primary btn-sm" onclick="showAddCompanyModal()">+ Add Company</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Company Name</th><th>Description</th><th>Members</th><th>Active Plans</th><th>Status</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="companies-tbody"><tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+      </table></div>
+    `;
+    const data = await GET('/api/admin/companies').catch(() => null);
+    if (data) {
+      document.getElementById('companies-tbody').innerHTML = data.items?.length ? data.items.map(c => `<tr>
+        <td><div style="font-weight:600;">${c.name}</div><div class="text-xs monospace text-muted">ID: ${c.id}</div></td>
+        <td class="text-sm">${c.description || '—'}</td>
+        <td class="text-sm">${c.memberCount || 0} members</td>
+        <td class="text-sm">${c.activePlans || 0} active</td>
+        <td>${c.is_active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Inactive</span>'}</td>
+        <td>
+          <button class="btn btn-ghost btn-sm" onclick="showEditCompanyModal('${c.id}', '${c.name}', '${c.description || ''}', ${c.is_active})">✏️</button>
+        </td>
+      </tr>`).join('') : '<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">No companies registered.</td></tr>';
     }
   } else if (tab === 'audit') {
     area.innerHTML = `
@@ -1143,10 +1510,267 @@ async function renderSettingsTab(tab) {
   }
 }
 
+// ── Service Modals & Actions ──────────────────────────────────────────────────
+window.showAddServiceModal = async function() {
+  const featuresData = await GET('/api/admin/features').catch(() => ({ items: [] }));
+  const features = featuresData.items || [];
+  
+  modal.open('Add Service Pricing', `
+    <div class="form-group"><label class="form-label">Tracked Feature</label>
+      <select id="asvc-feature" class="form-control">
+        <option value="">— Select Feature —</option>
+        ${features.map(f => `<option value="${f.featureName}">${f.featureName} (${f.eventCount} events, ${f.hasService ? 'Priced' : 'Unpriced'})</option>`).join('')}
+        <option value="CUSTOM">Enter Custom Feature Name…</option>
+      </select></div>
+    <div class="form-group" id="asvc-custom-name-wrap" style="display:none;"><label class="form-label">Custom Feature Name</label>
+      <input id="asvc-custom-name" class="form-control" placeholder="e.g. my_custom_tool_name" /></div>
+    <div class="form-group"><label class="form-label">Display Name</label>
+      <input id="asvc-display" class="form-control" placeholder="e.g. Custom Search Tool" /></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Source Service</label>
+        <select id="asvc-source" class="form-control">
+          <option value="BACKEND">BACKEND (AITM Backend)</option>
+          <option value="GOCLAW">GOCLAW</option>
+          <option value="N8N">N8N</option>
+          <option value="CUSTOM">CUSTOM</option>
+        </select></div>
+      <div class="form-group"><label class="form-label">Pricing Type</label>
+        <select id="asvc-pricing-type" class="form-control">
+          <option value="per_hit">Per Hit (Flat rate)</option>
+          <option value="per_1k_tokens">Per 1K Tokens (Token-based)</option>
+        </select></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Cost per Hit/1K Tokens (IDR)</label>
+        <input id="asvc-cost" type="number" step="0.000001" class="form-control" value="0.000000" min="0" /></div>
+      <div class="form-group"><label class="form-label">Currency</label>
+        <input id="asvc-currency" class="form-control" value="IDR" disabled /></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Monthly Hit Limit</label>
+        <input id="asvc-hit-limit" type="number" class="form-control" placeholder="No Limit" /></div>
+      <div class="form-group"><label class="form-label">Monthly Cost Limit</label>
+        <input id="asvc-cost-limit" type="number" step="0.01" class="form-control" placeholder="No Limit" /></div>
+    </div>
+    <div class="form-group"><label class="form-label">Description</label>
+      <input id="asvc-desc" class="form-control" placeholder="Description of service pricing..." /></div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="asvc-confirm">Create Service</button>
+  `);
+
+  const select = document.getElementById('asvc-feature');
+  const customWrap = document.getElementById('asvc-custom-name-wrap');
+  select.addEventListener('change', () => {
+    if (select.value === 'CUSTOM') {
+      customWrap.style.display = 'block';
+    } else {
+      customWrap.style.display = 'none';
+      if (select.value) {
+        document.getElementById('asvc-display').value = select.value
+          .replace(/^(mcp_)?/, '')
+          .replace(/__/g, ': ')
+          .replace(/_/g, ' ')
+          .split(' ')
+          .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ');
+      }
+    }
+  });
+
+  document.getElementById('asvc-confirm').addEventListener('click', async () => {
+    const featureName = select.value === 'CUSTOM' ? document.getElementById('asvc-custom-name').value.trim() : select.value;
+    const displayName = document.getElementById('asvc-display').value.trim();
+    const sourceService = document.getElementById('asvc-source').value;
+    const pricingType = document.getElementById('asvc-pricing-type').value;
+    const costPerHit = parseFloat(document.getElementById('asvc-cost').value) || 0;
+    const costCurrency = document.getElementById('asvc-currency').value;
+    const hitLimitMonthly = parseInt(document.getElementById('asvc-hit-limit').value) || null;
+    const costLimitMonthly = parseFloat(document.getElementById('asvc-cost-limit').value) || null;
+    const description = document.getElementById('asvc-desc').value.trim();
+
+    if (!featureName) return showToast('Please select or enter a feature name', 'error');
+    if (!displayName) return showToast('Please enter a display name', 'error');
+
+    try {
+      await POST('/api/admin/services', {
+        serviceName: featureName,
+        sourceService,
+        displayName,
+        pricingType,
+        costPerHit,
+        costCurrency,
+        hitLimitMonthly,
+        costLimitMonthly,
+        description
+      });
+      modal.close();
+      showToast('Service pricing registered successfully', 'success');
+      renderSettingsTab('services');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+};
+
+window.showEditServiceModal = async function(svcId) {
+  const data = await GET('/api/admin/services').catch(() => null);
+  if (!data) return showToast('Failed to load service details', 'error');
+  const service = data.items.find(s => s.id === svcId);
+  if (!service) return showToast('Service not found', 'error');
+
+  modal.open('Edit Service Pricing', `
+    <div class="form-group"><label class="form-label">Service Feature Name</label>
+      <input class="form-control" value="${service.service_name}" disabled /></div>
+    <div class="form-group"><label class="form-label">Display Name</label>
+      <input id="esvc-display" class="form-control" value="${service.display_name}" /></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Pricing Type</label>
+        <select id="esvc-pricing-type" class="form-control">
+          <option value="per_hit" ${service.pricing_type === 'per_hit' ? 'selected' : ''}>Per Hit (Flat rate)</option>
+          <option value="per_1k_tokens" ${service.pricing_type === 'per_1k_tokens' ? 'selected' : ''}>Per 1K Tokens (Token-based)</option>
+        </select></div>
+      <div class="form-group"><label class="form-label">Cost per Hit/1K Tokens (IDR)</label>
+        <input id="esvc-cost" type="number" step="0.000001" class="form-control" value="${service.cost_per_hit}" min="0" /></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Currency</label>
+        <input id="esvc-currency" class="form-control" value="IDR" disabled /></div>
+      <div class="form-group"><label class="form-label">Monthly Hit Limit</label>
+        <input id="esvc-hit-limit" type="number" class="form-control" value="${service.hit_limit_monthly || ''}" placeholder="No Limit" /></div>
+    </div>
+    <div class="form-group"><label class="form-label">Monthly Cost Limit</label>
+      <input id="esvc-cost-limit" type="number" step="0.01" class="form-control" value="${service.cost_limit_monthly || ''}" placeholder="No Limit" /></div>
+    <div class="form-group"><label class="form-label">Description</label>
+      <input id="esvc-desc" class="form-control" value="${service.description || ''}" /></div>
+    <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+      <input id="esvc-active" type="checkbox" ${service.is_active ? 'checked' : ''} style="width:auto;" />
+      <label class="form-label" style="margin:0;" for="esvc-active">Active</label>
+    </div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="esvc-confirm">Save Changes</button>
+  `);
+
+  document.getElementById('esvc-confirm').addEventListener('click', async () => {
+    const displayName = document.getElementById('esvc-display').value.trim();
+    const pricingType = document.getElementById('esvc-pricing-type').value;
+    const costPerHit = parseFloat(document.getElementById('esvc-cost').value) || 0;
+    const costCurrency = document.getElementById('esvc-currency').value;
+    const hitLimitMonthly = parseInt(document.getElementById('esvc-hit-limit').value) || null;
+    const costLimitMonthly = parseFloat(document.getElementById('esvc-cost-limit').value) || null;
+    const description = document.getElementById('esvc-desc').value.trim();
+    const isActive = document.getElementById('esvc-active').checked;
+
+    if (!displayName) return showToast('Please enter a display name', 'error');
+
+    try {
+      await PATCH(`/api/admin/services/${svcId}`, {
+        displayName,
+        pricingType,
+        costPerHit,
+        costCurrency,
+        hitLimitMonthly,
+        costLimitMonthly,
+        description,
+        isActive
+      });
+      modal.close();
+      showToast('Service pricing updated successfully', 'success');
+      renderSettingsTab('services');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+};
+
+window.deactivateService = async function(svcId, displayName) {
+  if (!confirm(`Are you sure you want to deactivate pricing for "${displayName}"?`)) return;
+  try {
+    await DEL(`/api/admin/services/${svcId}`);
+    showToast('Service pricing deactivated', 'success');
+    renderSettingsTab('services');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
+
+window.recalculateCosts = async function() {
+  if (!confirm('Are you sure you want to recalculate cost_amount for all existing uncosted (0 cost) events based on current service registry pricing?')) return;
+  try {
+    const res = await POST('/api/admin/services/recalculate', {});
+    showToast(`Recalculation complete. ${res.eventsUpdated} events updated across ${res.servicesProcessed} services.`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
+
+// ── Company Modals & Actions ──────────────────────────────────────────────────
+window.showAddCompanyModal = function() {
+  modal.open('Create Company Profile', `
+    <div class="form-group"><label class="form-label">Company Name</label>
+      <input id="acomp-name" class="form-control" placeholder="e.g. Lintasarta" /></div>
+    <div class="form-group"><label class="form-label">Description</label>
+      <input id="acomp-desc" class="form-control" placeholder="e.g. Lintasarta Subsidiary or Dept..." /></div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="acomp-confirm">Create Company</button>
+  `);
+
+  document.getElementById('acomp-confirm').addEventListener('click', async () => {
+    const name = document.getElementById('acomp-name').value.trim();
+    const description = document.getElementById('acomp-desc').value.trim();
+
+    if (!name) return showToast('Please enter a company name', 'error');
+
+    try {
+      await POST('/api/admin/companies', { name, description });
+      modal.close();
+      showToast('Company profile created successfully', 'success');
+      renderSettingsTab('companies');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+};
+
+window.showEditCompanyModal = function(compId, name, desc, isActive) {
+  modal.open('Edit Company Profile', `
+    <div class="form-group"><label class="form-label">Company Name</label>
+      <input id="ecomp-name" class="form-control" value="${name}" /></div>
+    <div class="form-group"><label class="form-label">Description</label>
+      <input id="ecomp-desc" class="form-control" value="${desc}" /></div>
+    <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+      <input id="ecomp-active" type="checkbox" ${isActive ? 'checked' : ''} style="width:auto;" />
+      <label class="form-label" style="margin:0;" for="ecomp-active">Active</label>
+    </div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="ecomp-confirm">Save Changes</button>
+  `);
+
+  document.getElementById('ecomp-confirm').addEventListener('click', async () => {
+    const newName = document.getElementById('ecomp-name').value.trim();
+    const newDesc = document.getElementById('ecomp-desc').value.trim();
+    const newActive = document.getElementById('ecomp-active').checked;
+
+    if (!newName) return showToast('Please enter a company name', 'error');
+
+    try {
+      await PATCH(`/api/admin/companies/${compId}`, { name: newName, description: newDesc, isActive: newActive });
+      modal.close();
+      showToast('Company profile updated successfully', 'success');
+      renderSettingsTab('companies');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+};
+
 window.runThrottleCheck = async function() {
   try {
     const res = await POST('/api/admin/throttle/run', {});
-    if (res) showToast(`${t('throttle_run_ok')} ${res.actions?.length || 0} actions.`, 'success');
+    if (res) showToast(`${t('throttle_run_ok') || 'Throttle check completed.'} ${res.actions?.length || 0} actions.`, 'success');
   } catch (err) { showToast(err.message, 'error'); }
 };
 
@@ -1312,6 +1936,157 @@ pages.myPlan = async function() {
     `;
   } catch (err) { showToast(t('error_load'), 'error'); }
 };
+
+/* ── User Management Modals ──────────────────────────────────────────────────── */
+async function showCreateUserModal(onSuccess) {
+  // Load companies for dropdown
+  const companiesData = await GET('/api/admin/companies').catch(() => ({ items: [] }));
+  const companies = companiesData.items || [];
+
+  modal.open('➕ Create New User', `
+    <div class="form-group">
+      <label class="form-label">Full Name</label>
+      <input type="text" id="cu-name" class="form-control" placeholder="Enter full name" required />
+    </div>
+    <div class="form-group">
+      <label class="form-label">Email</label>
+      <input type="email" id="cu-email" class="form-control" placeholder="user@example.com" required />
+    </div>
+    <div class="form-group">
+      <label class="form-label">Password</label>
+      <input type="password" id="cu-password" class="form-control" placeholder="Minimum 6 characters" required />
+    </div>
+    <div class="form-group">
+      <label class="form-label">Role</label>
+      <select id="cu-role" class="form-control">
+        <option value="HUMAN RESOURCES">Human Resources</option>
+        <option value="HIRING MANAGER">Hiring Manager</option>
+        <option value="ADMIN">Admin</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Company</label>
+      <select id="cu-company" class="form-control">
+        <option value="">— No Company —</option>
+        ${companies.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+      </select>
+    </div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="cu-submit">Create User</button>
+  `);
+
+  document.getElementById('cu-submit').addEventListener('click', async () => {
+    const name = document.getElementById('cu-name').value.trim();
+    const email = document.getElementById('cu-email').value.trim();
+    const password = document.getElementById('cu-password').value;
+    const role = document.getElementById('cu-role').value;
+    const companyId = document.getElementById('cu-company').value || null;
+
+    if (!name || !email || !password) { showToast('Please fill all fields', 'error'); return; }
+    if (password.length < 6) { showToast('Password must be at least 6 characters', 'error'); return; }
+
+    try {
+      const btn = document.getElementById('cu-submit');
+      btn.disabled = true; btn.textContent = 'Creating…';
+      await POST('/api/admin/users', { name, email, password, role, companyId });
+      showToast(`User "${name}" created successfully!`, 'success');
+      modal.close();
+      if (typeof onSuccess === 'function') onSuccess();
+    } catch (err) {
+      showToast(err.message || 'Failed to create user', 'error');
+      const btn = document.getElementById('cu-submit');
+      if (btn) { btn.disabled = false; btn.textContent = 'Create User'; }
+    }
+  });
+}
+window.showCreateUserModal = showCreateUserModal;
+
+async function showEditUserModal(userId, name, email, role, onSuccess) {
+  // Load companies and current user mapping
+  const [companiesData, mappingData] = await Promise.all([
+    GET('/api/admin/companies').catch(() => ({ items: [] })),
+    GET('/api/admin/mappings').catch(() => ({ items: [] }))
+  ]);
+  const companies = companiesData.items || [];
+  const userMapping = (mappingData.items || []).find(m => m.user_id === userId);
+  const currentCompanyId = userMapping?.company_id || '';
+
+  modal.open('✏️ Edit User', `
+    <div class="form-group">
+      <label class="form-label">Full Name</label>
+      <input type="text" id="eu-name" class="form-control" value="${name}" />
+    </div>
+    <div class="form-group">
+      <label class="form-label">Email</label>
+      <input type="email" id="eu-email" class="form-control" value="${email}" />
+    </div>
+    <div class="form-group">
+      <label class="form-label">New Password (leave blank to keep current)</label>
+      <input type="password" id="eu-password" class="form-control" placeholder="Leave blank to keep" />
+    </div>
+    <div class="form-group">
+      <label class="form-label">Role</label>
+      <select id="eu-role" class="form-control">
+        <option value="HUMAN RESOURCES" ${role === 'HUMAN RESOURCES' ? 'selected' : ''}>Human Resources</option>
+        <option value="HIRING MANAGER" ${role === 'HIRING MANAGER' ? 'selected' : ''}>Hiring Manager</option>
+        <option value="ADMIN" ${role === 'ADMIN' ? 'selected' : ''}>Admin</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Company</label>
+      <select id="eu-company" class="form-control">
+        <option value="">— No Company —</option>
+        ${companies.map(c => `<option value="${c.id}" ${c.id === currentCompanyId ? 'selected' : ''}>${c.name}</option>`).join('')}
+      </select>
+    </div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="eu-submit">Save Changes</button>
+  `);
+
+  document.getElementById('eu-submit').addEventListener('click', async () => {
+    const body = {};
+    const newName = document.getElementById('eu-name').value.trim();
+    const newEmail = document.getElementById('eu-email').value.trim();
+    const newPass = document.getElementById('eu-password').value;
+    const newRole = document.getElementById('eu-role').value;
+    const newCompanyId = document.getElementById('eu-company').value || null;
+
+    if (newName && newName !== name) body.name = newName;
+    if (newEmail && newEmail !== email) body.email = newEmail;
+    if (newPass) body.password = newPass;
+    if (newRole !== role) body.role = newRole;
+    // Always include companyId so it can be updated
+    body.companyId = newCompanyId;
+
+    try {
+      const btn = document.getElementById('eu-submit');
+      btn.disabled = true; btn.textContent = 'Saving…';
+      await PATCH(`/api/admin/users/${userId}`, body);
+      showToast('User updated successfully!', 'success');
+      modal.close();
+      if (typeof onSuccess === 'function') onSuccess();
+    } catch (err) {
+      showToast(err.message || 'Failed to update user', 'error');
+      const btn = document.getElementById('eu-submit');
+      if (btn) { btn.disabled = false; btn.textContent = 'Save Changes'; }
+    }
+  });
+}
+window.showEditUserModal = showEditUserModal;
+
+async function deleteUser(userId, name, onSuccess) {
+  if (!confirm(`Are you sure you want to delete user "${name}"? This action cannot be undone.`)) return;
+  try {
+    await DEL(`/api/admin/users/${userId}`);
+    showToast(`User "${name}" deleted`, 'success');
+    if (typeof onSuccess === 'function') onSuccess();
+  } catch (err) {
+    showToast(err.message || 'Failed to delete user', 'error');
+  }
+}
+window.deleteUser = deleteUser;
 
 /* ─── Bootstrap ──────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {

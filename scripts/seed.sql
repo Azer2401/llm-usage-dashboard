@@ -99,7 +99,7 @@ ON CONFLICT (user_id) DO NOTHING;
 
 -- ─── 6. Default Token Plan Example ───────────────────────────────────────────
 -- Create a starter monthly plan
-INSERT INTO llm_token_plans (id, name, quota_type, quota_tokens, price_amount, currency, description, is_active, created_at, updated_at)
+INSERT INTO llm_token_plans (id, name, "quotaType", "quotaTokens", "priceAmount", currency, description, "isActive", created_at, updated_at)
 VALUES (
   gen_random_uuid(),
   'Monthly Standard',

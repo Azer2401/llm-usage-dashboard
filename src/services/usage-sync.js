@@ -42,25 +42,25 @@ async function resolveSenderToUserId(senderIds) {
   if (candidateUuids.length > 0) {
     try {
       const placeholders = candidateUuids.map((_, i) => `$${i + 1}`).join(',');
-      const userRes = await aitmPool.query(`SELECT id FROM users WHERE id IN (${placeholders})`, candidateUuids);
-      const validUserIds = new Set(userRes.rows.map(u => u.id));
+      const userRes = await aitmPool.query(`SELECT id, name, email FROM users WHERE id IN (${placeholders})`, candidateUuids);
+      const userMap = new Map(userRes.rows.map(u => [u.id, u]));
 
       for (const [sid, candidate] of Object.entries(senderToCandidate)) {
-        if (validUserIds.has(candidate)) {
-          senderToUser[sid] = candidate;
-          // Auto-upsert into llm_user_mappings
-          try {
-            await dashboardPool.query(`
-              INSERT INTO llm_user_mappings (id, user_id, goclaw_sender_id, goclaw_display_name, match_confidence, created_at, updated_at)
-              VALUES (gen_random_uuid(), $1, $2, 'WebSocket User', 'auto', NOW(), NOW())
-              ON CONFLICT (user_id) DO UPDATE SET
-                goclaw_sender_id = COALESCE(llm_user_mappings.goclaw_sender_id, EXCLUDED.goclaw_sender_id),
-                updated_at = NOW()
-            `, [candidate, sid]);
-          } catch (e) {
-            // ignore conflict
-          }
-        }
+        senderToUser[sid] = candidate;
+        const matched = userMap.get(candidate);
+        const displayName = matched ? matched.name : `Demo User (${candidate.slice(0, 8)})`;
+
+        // Auto-upsert into llm_user_mappings
+        try {
+          await dashboardPool.query(`
+            INSERT INTO llm_user_mappings (id, user_id, goclaw_sender_id, goclaw_display_name, match_confidence, created_at, updated_at)
+            VALUES (gen_random_uuid(), $1, $2, $3, 'auto', NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+              goclaw_sender_id = COALESCE(llm_user_mappings.goclaw_sender_id, EXCLUDED.goclaw_sender_id),
+              goclaw_display_name = COALESCE(llm_user_mappings.goclaw_display_name, EXCLUDED.goclaw_display_name),
+              updated_at = NOW()
+          `, [candidate, sid, displayName]);
+        } catch (e) {}
       }
     } catch (err) {
       console.warn('[Sync] Failed to verify candidate UUIDs with AITM users:', err.message);
@@ -69,10 +69,24 @@ async function resolveSenderToUserId(senderIds) {
 
   // 3. Fallback: match by username / email prefix (e.g. 'falih1')
   for (const sid of senderIds) {
-    if (senderToUser[sid] || sid === 'system') continue;
+    if (senderToUser[sid]) continue;
+
+    if (sid === 'system') {
+      const sysId = '00000000-0000-0000-0000-000000000000';
+      senderToUser[sid] = sysId;
+      try {
+        await dashboardPool.query(`
+          INSERT INTO llm_user_mappings (id, user_id, goclaw_sender_id, goclaw_display_name, match_confidence, created_at, updated_at)
+          VALUES (gen_random_uuid(), $1, $2, 'System Agent', 'auto', NOW(), NOW())
+          ON CONFLICT (user_id) DO NOTHING
+        `, [sysId, sid]);
+      } catch (e) {}
+      continue;
+    }
+
     try {
       const userRes = await aitmPool.query(`
-        SELECT id FROM users
+        SELECT id, name FROM users
         WHERE name ILIKE $1 OR email ILIKE $1
         LIMIT 1
       `, [`%${sid}%`]);
@@ -86,14 +100,22 @@ async function resolveSenderToUserId(senderIds) {
             ON CONFLICT (user_id) DO UPDATE SET
               goclaw_sender_id = COALESCE(llm_user_mappings.goclaw_sender_id, EXCLUDED.goclaw_sender_id),
               updated_at = NOW()
-          `, [uid, sid, sid]);
-        } catch (e) {
-          // ignore
-        }
+          `, [uid, sid, userRes.rows[0].name || sid]);
+        } catch (e) {}
+      } else {
+        // Fallback for any other sender ID (e.g. WhatsApp LID)
+        const genId = require('crypto').createHash('md5').update(sid).digest('hex');
+        const formattedUuid = `${genId.slice(0,8)}-${genId.slice(8,12)}-4${genId.slice(13,16)}-a${genId.slice(17,20)}-${genId.slice(20,32)}`;
+        senderToUser[sid] = formattedUuid;
+        try {
+          await dashboardPool.query(`
+            INSERT INTO llm_user_mappings (id, user_id, goclaw_sender_id, goclaw_display_name, match_confidence, created_at, updated_at)
+            VALUES (gen_random_uuid(), $1, $2, $3, 'auto', NOW(), NOW())
+            ON CONFLICT (user_id) DO NOTHING
+          `, [formattedUuid, sid, `GoClaw User (${sid.slice(0, 12)})`]);
+        } catch (e) {}
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }
 
   return senderToUser;

@@ -45,7 +45,7 @@ services:
       - AITM_DB_PASSWORD=n8ndevops
       - GOCLAW_DB_HOST=host.docker.internal
       - GOCLAW_DB_PORT=5433
-      - GOCLAW_DB_NAME=postgres
+      - GOCLAW_DB_NAME=goclaw_v314
       - GOCLAW_DB_USER=postgres
       - GOCLAW_DB_PASSWORD=goclaw
       - GOCLAW_API_URL=http://host.docker.internal:18790

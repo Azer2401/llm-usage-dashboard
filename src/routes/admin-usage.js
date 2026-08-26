@@ -94,22 +94,44 @@ router.get('/overview', async (req, res) => {
     if (topConsumersRes.rows.length > 0) {
       const uIds = topConsumersRes.rows.map(r => r.user_id);
       const { rows: userInfo } = await aitmPool.query(`
-        SELECT u.id AS user_id, u.name, u.email, ur.role_name AS role
+        SELECT u.id AS user_id, u.name, u.email, COALESCE(ur.role_name, 'HUMAN RESOURCES') AS role
         FROM users u
-        JOIN employees emp ON emp.user_id = u.id
-        JOIN user_roles ur ON ur.id = emp.user_role_id
-        WHERE u.id = ANY($1) AND ur.role_name IN ('HUMAN RESOURCES', 'HIRING MANAGER')
+        LEFT JOIN employees emp ON emp.user_id = u.id
+        LEFT JOIN user_roles ur ON ur.id = emp.user_role_id
+        WHERE u.id = ANY($1)
       `, [uIds]);
       const userDict = new Map(userInfo.map(u => [u.user_id, u]));
 
+      try {
+        const { rows: mapInfo } = await dashboardPool.query(`
+          SELECT user_id, goclaw_sender_id, goclaw_display_name FROM llm_user_mappings WHERE user_id = ANY($1)
+        `, [uIds]);
+        for (const m of mapInfo) {
+          if (!userDict.has(m.user_id)) {
+            userDict.set(m.user_id, {
+              user_id: m.user_id,
+              name: m.goclaw_display_name || `User (${m.user_id.slice(0, 8)})`,
+              email: m.goclaw_sender_id || '',
+              role: 'HUMAN RESOURCES',
+            });
+          }
+        }
+      } catch (err) {}
+
       topUsersRows = topConsumersRes.rows
-        .filter(r => userDict.has(r.user_id))
-        .map(r => ({
-          ...r,
-          name: userDict.get(r.user_id).name,
-          email: userDict.get(r.user_id).email,
-          role: userDict.get(r.user_id).role,
-        }))
+        .map(r => {
+          const u = userDict.get(r.user_id) || {
+            name: `User (${r.user_id ? r.user_id.slice(0, 8) : 'System'})`,
+            email: '',
+            role: 'HUMAN RESOURCES',
+          };
+          return {
+            ...r,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+          };
+        })
         .slice(0, 10);
     }
 
@@ -345,26 +367,51 @@ router.get('/events', async (req, res) => {
       WHERE created_at BETWEEN $1 AND $2 ${whereExtra}
     `, params);
 
-    // Resolve user names & emails from AITM DB
+    // Resolve user names & emails from AITM DB + llm_user_mappings
     const userIds = [...new Set(events.map(e => e.user_id).filter(Boolean))];
     let userDict = new Map();
     if (userIds.length > 0) {
-      const { rows: users } = await aitmPool.query(`
-        SELECT u.id, u.name, u.email FROM users u WHERE u.id = ANY($1)
-      `, [userIds]);
-      userDict = new Map(users.map(u => [u.id, u]));
+      try {
+        const { rows: users } = await aitmPool.query(`
+          SELECT u.id, u.name, u.email FROM users u WHERE u.id = ANY($1)
+        `, [userIds]);
+        for (const u of users) userDict.set(u.id, { name: u.name, email: u.email });
+      } catch (err) {
+        console.warn('[Admin] Failed to resolve users from AITM:', err.message);
+      }
+
+      // Check llm_user_mappings for any unresolved IDs
+      try {
+        const { rows: mappings } = await dashboardPool.query(`
+          SELECT user_id, goclaw_sender_id, goclaw_display_name FROM llm_user_mappings WHERE user_id = ANY($1) OR goclaw_sender_id = ANY($1)
+        `, [userIds]);
+        for (const m of mappings) {
+          if (!userDict.has(m.user_id) && m.goclaw_display_name) {
+            userDict.set(m.user_id, { name: m.goclaw_display_name, email: m.goclaw_sender_id || '' });
+          }
+          if (m.goclaw_sender_id && !userDict.has(m.goclaw_sender_id) && m.goclaw_display_name) {
+            userDict.set(m.goclaw_sender_id, { name: m.goclaw_display_name, email: m.goclaw_sender_id });
+          }
+        }
+      } catch (err) {}
     }
 
     const items = events.map(e => {
       const u = userDict.get(e.user_id) || {};
+      let meta = {};
+      try { meta = typeof e.metadata_json === 'string' ? JSON.parse(e.metadata_json) : (e.metadata_json || {}); } catch(err) {}
+      const fallbackName = meta.goclawSenderId ? `GoClaw (${meta.goclawSenderId})` : (e.user_id ? `User (${e.user_id.slice(0, 8)})` : 'System');
+      const resolvedName = u.name || fallbackName;
+      const resolvedEmail = u.email || (meta.goclawSenderId || '');
+
       return {
         id: e.id,
         userId: e.user_id,
         user_id: e.user_id,
-        userName: u.name || null,
-        user_name: u.name || null,
-        userEmail: u.email || null,
-        user_email: u.email || null,
+        userName: resolvedName,
+        user_name: resolvedName,
+        userEmail: resolvedEmail,
+        user_email: resolvedEmail,
         sourceService: e.source_service,
         source_service: e.source_service,
         featureName: e.feature_name,

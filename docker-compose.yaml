@@ -16,7 +16,50 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
+      - n8n_default
+
+  llm-dashboard-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-dashboard-app
+    restart: unless-stopped
+    depends_on:
+      llm-dashboard-pg:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - PORT=3003
+      - NODE_ENV=production
+      - DASHBOARD_DB_HOST=llm-dashboard-pg
+      - DASHBOARD_DB_PORT=5432
+      - DATABASE_URL=postgresql://llm_user:llmdevops2026@llm-dashboard-pg:5432/llm_dashboard_db?schema=public
+      - AITM_DB_HOST=n8n-postgres
+      - AITM_DB_PORT=5432
+      - GOCLAW_DB_HOST=goclaw-pg
+      - GOCLAW_DB_PORT=5432
+      - GOCLAW_API_URL=http://goclaw-goclaw-1:18790
+      - DEFAULT_THROTTLE_REQUEST_LIMIT=50
+      - DEFAULT_MESSAGE_LIMIT=50
+    ports:
+      - "3003:3003"
+    networks:
+      - default
+      - n8n_default
+      - goclaw-net
 
 volumes:
   llm_pg_data:
     driver: local
+
+networks:
+  default:
+  n8n_default:
+    external: true
+  goclaw-net:
+    external: true

@@ -18,7 +18,6 @@ services:
       retries: 5
     networks:
       - default
-      - n8n_default
 
   llm-dashboard-app:
     build:
@@ -39,19 +38,23 @@ services:
       - DASHBOARD_DB_HOST=llm-dashboard-pg
       - DASHBOARD_DB_PORT=5432
       - DATABASE_URL=postgresql://llm_user:llmdevops2026@llm-dashboard-pg:5432/llm_dashboard_db?schema=public
-      - AITM_DB_HOST=n8n-postgres
+      - AITM_DB_HOST=host.docker.internal
       - AITM_DB_PORT=5432
-      - GOCLAW_DB_HOST=goclaw-pg
-      - GOCLAW_DB_PORT=5432
-      - GOCLAW_API_URL=http://goclaw-goclaw-1:18790
+      - AITM_DB_NAME=n8n_db
+      - AITM_DB_USER=n8n_user
+      - AITM_DB_PASSWORD=n8ndevops
+      - GOCLAW_DB_HOST=host.docker.internal
+      - GOCLAW_DB_PORT=5433
+      - GOCLAW_DB_NAME=postgres
+      - GOCLAW_DB_USER=postgres
+      - GOCLAW_DB_PASSWORD=goclaw
+      - GOCLAW_API_URL=http://host.docker.internal:18790
       - DEFAULT_THROTTLE_REQUEST_LIMIT=50
       - DEFAULT_MESSAGE_LIMIT=50
     ports:
       - "3003:3003"
     networks:
       - default
-      - n8n_default
-      - goclaw-net
 
 volumes:
   llm_pg_data:
@@ -59,7 +62,3 @@ volumes:
 
 networks:
   default:
-  n8n_default:
-    external: true
-  goclaw-net:
-    external: true

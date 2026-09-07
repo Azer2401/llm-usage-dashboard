@@ -7,6 +7,65 @@ const { dashboardPool, aitmPool } = require('../db');
 const router = Router();
 router.use(requireAuth, requireAdmin);
 
+// ─── Plan member cap ──────────────────────────────────────────────────────────
+// The cap counts AITM `employees` rows — true company headcount — not
+// llm_user_mappings, which only covers agent-enabled members. max_members of
+// NULL means unlimited, matching the "0 or NULL = not configured" convention
+// already used for llm_service_registry cost limits.
+
+async function getCompanyHeadcount(companyId) {
+  const { rows } = await aitmPool.query(
+    `SELECT COUNT(*)::int AS headcount FROM employees WHERE company_id = $1`,
+    [companyId]
+  );
+  return rows[0].headcount;
+}
+
+async function getActiveCompanyPlan(companyId) {
+  const { rows } = await dashboardPool.query(`
+    SELECT p.id, p.name, p.max_members
+    FROM llm_plan_assignments a
+    JOIN llm_token_plans p ON p.id = a.plan_id
+    WHERE a.company_id = $1 AND a.is_active = true
+    ORDER BY a.created_at DESC
+    LIMIT 1
+  `, [companyId]);
+  return rows[0] || null;
+}
+
+// A user's company comes from AITM, so an individually-assigned plan cannot be
+// used to sidestep a cap that the company has already exceeded.
+async function getUserCompanyId(userId) {
+  const { rows } = await aitmPool.query(
+    `SELECT company_id FROM employees WHERE user_id = $1`,
+    [userId]
+  );
+  return rows[0]?.company_id || null;
+}
+
+/**
+ * Returns null when the company fits under the plan cap, otherwise the reason
+ * payload for a 409. Headcount equal to the cap is allowed; only strictly over
+ * is blocked, so a company sitting exactly at its tier keeps working.
+ */
+async function checkMemberCap(companyId, plan) {
+  const maxMembers = plan && plan.max_members !== null && plan.max_members !== undefined
+    ? Number(plan.max_members)
+    : null;
+  if (!maxMembers || maxMembers <= 0) return null;
+
+  const headcount = await getCompanyHeadcount(companyId);
+  if (headcount <= maxMembers) return null;
+
+  return {
+    error: `Company has ${headcount} members but plan "${plan.name}" allows ${maxMembers}. Raise the plan cap or assign a larger tier.`,
+    code: 'PLAN_MEMBER_CAP_EXCEEDED',
+    headcount,
+    maxMembers,
+    planName: plan.name,
+  };
+}
+
 // ─── Plans CRUD ───────────────────────────────────────────────────────────────
 router.get('/plans', async (req, res) => {
   try {
@@ -22,7 +81,7 @@ router.get('/plans', async (req, res) => {
     for (const r of rows) {
       const { rows: svcs } = await dashboardPool.query(`
         SELECT ps.service_id, ps.hit_limit_monthly, ps.cost_limit_monthly,
-               sr.service_name, sr.display_name
+               sr.service_name, sr.display_name, sr.cost_currency
         FROM llm_plan_services ps
         JOIN llm_service_registry sr ON sr.id = ps.service_id
         WHERE ps.plan_id = $1
@@ -32,13 +91,15 @@ router.get('/plans', async (req, res) => {
         ...r,
         quotaTokens: Number(r.quota_tokens),
         quotaMessages: r.quota_messages !== null && r.quota_messages !== undefined ? Number(r.quota_messages) : null,
+        maxMembers: r.max_members !== null && r.max_members !== undefined ? Number(r.max_members) : null,
         assignmentCount: Number(r.assignment_count),
         services: svcs.map(s => ({
           serviceId: s.service_id,
           serviceName: s.service_name,
           displayName: s.display_name,
           hitLimitMonthly: s.hit_limit_monthly,
-          costLimitMonthly: s.cost_limit_monthly ? parseFloat(s.cost_limit_monthly) : null
+          costLimitMonthly: s.cost_limit_monthly ? parseFloat(s.cost_limit_monthly) : null,
+          costCurrency: s.cost_currency
         }))
       });
     }
@@ -50,7 +111,7 @@ router.post('/plans', async (req, res) => {
   const client = await dashboardPool.connect();
   try {
     await client.query('BEGIN');
-    const { name, quotaType, quotaTokens, quotaMessages, priceAmount = 0, currency = 'IDR', description, isActive = true, services = [] } = req.body;
+    const { name, quotaType, quotaTokens, quotaMessages, maxMembers, priceAmount = 0, currency = 'IDR', description, isActive = true, services = [] } = req.body;
     if (!name || !quotaType || !quotaTokens) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'name, quotaType, quotaTokens required' });
@@ -67,12 +128,16 @@ router.post('/plans', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'quotaMessages must be > 0 when set' });
     }
+    if (maxMembers !== undefined && maxMembers !== null && maxMembers <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'maxMembers must be > 0 when set' });
+    }
 
     const { rows } = await client.query(`
-      INSERT INTO llm_token_plans (id, name, quota_type, quota_tokens, quota_messages, price_amount, currency, description, is_active, created_at, updated_at)
-      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      INSERT INTO llm_token_plans (id, name, quota_type, quota_tokens, quota_messages, max_members, price_amount, currency, description, is_active, created_at, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
       RETURNING *
-    `, [name, quotaType, quotaTokens, quotaMessages ?? null, priceAmount, currency, description || null, isActive]);
+    `, [name, quotaType, quotaTokens, quotaMessages ?? null, maxMembers ?? null, priceAmount, currency, description || null, isActive]);
 
     const plan = rows[0];
     plan.services = [];
@@ -108,7 +173,7 @@ router.patch('/plans/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { id } = req.params;
-    const { name, quotaTokens, quotaMessages, priceAmount, currency, description, isActive, services } = req.body;
+    const { name, quotaTokens, quotaMessages, maxMembers, priceAmount, currency, description, isActive, services } = req.body;
 
     const existing = await client.query(`SELECT * FROM llm_token_plans WHERE id = $1`, [id]);
     if (existing.rows.length === 0) {
@@ -137,6 +202,17 @@ router.patch('/plans/:id', async (req, res) => {
       rows = (await client.query(`
         UPDATE llm_token_plans SET quota_messages = $1, updated_at = NOW() WHERE id = $2 RETURNING *
       `, [quotaMessages ?? null, id])).rows;
+    }
+
+    // same for max_members — clearing the cap back to unlimited must be possible
+    if ('maxMembers' in req.body) {
+      if (maxMembers !== null && maxMembers !== undefined && maxMembers <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'maxMembers must be > 0 when set' });
+      }
+      rows = (await client.query(`
+        UPDATE llm_token_plans SET max_members = $1, updated_at = NOW() WHERE id = $2 RETURNING *
+      `, [maxMembers ?? null, id])).rows;
     }
 
     if (services && Array.isArray(services)) {
@@ -199,6 +275,15 @@ router.post('/assignments', async (req, res) => {
     if (planRes.rows.length === 0) return res.status(400).json({ error: 'Plan not found or inactive' });
     const plan = planRes.rows[0];
 
+    // Cap check runs BEFORE the previous assignment is deactivated: this route is
+    // not transactional, so blocking after that point would leave the company
+    // with no active plan at all.
+    const capCompanyId = companyId || (userId ? await getUserCompanyId(userId) : null);
+    if (capCompanyId) {
+      const capViolation = await checkMemberCap(capCompanyId, plan);
+      if (capViolation) return res.status(409).json(capViolation);
+    }
+
     if (userId) {
       await dashboardPool.query(`UPDATE llm_plan_assignments SET is_active = false, ended_at = NOW(), updated_at = NOW() WHERE user_id = $1 AND is_active = true`, [userId]);
     }
@@ -224,32 +309,111 @@ router.post('/assignments', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Re-open the current billing period on the same plan.
+//
+// usedMessages is counted from the assignment's starts_at (getPeriodWindow in
+// services/quota.js), so re-dating the assignment drops usage back to zero.
+// Use this for a repeat demo or a mid-period renewal. When the customer paid
+// for extra messages on top of the period they already have, POST /bundles is
+// the right tool — it stacks without discarding the period.
+router.post('/assignments/:id/reset', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = (req.body && req.body.reason) || null;
+
+    const existing = await dashboardPool.query(`
+      SELECT a.*, p.quota_type, p.name AS plan_name
+      FROM llm_plan_assignments a
+      JOIN llm_token_plans p ON p.id = a.plan_id
+      WHERE a.id = $1
+    `, [id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    const assignment = existing.rows[0];
+    if (!assignment.is_active) return res.status(409).json({ error: 'Assignment is no longer active' });
+
+    // Mirrors the reset_at derivation in POST /assignments so a reset period and
+    // a freshly assigned one always expire on the same kind of boundary.
+    const start = new Date();
+    const reset = new Date(start);
+    if (assignment.quota_type === 'YEARLY') {
+      reset.setFullYear(reset.getFullYear() + 1); reset.setMonth(0); reset.setDate(1); reset.setHours(0, 0, 0, 0);
+    } else {
+      reset.setMonth(reset.getMonth() + 1); reset.setDate(1); reset.setHours(0, 0, 0, 0);
+    }
+
+    const { rows } = await dashboardPool.query(`
+      UPDATE llm_plan_assignments
+      SET starts_at = $1, reset_at = $2, updated_at = NOW()
+      WHERE id = $3
+      RETURNING *
+    `, [start, reset, id]);
+
+    await dashboardPool.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, before_json, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'quota.reset', 'llm_plan_assignment', $2, $3, $4, NOW())`,
+      [req.user.id, id,
+       JSON.stringify({ startsAt: assignment.starts_at, resetAt: assignment.reset_at }),
+       JSON.stringify({ startsAt: start, resetAt: reset, planName: assignment.plan_name, reason })]);
+
+    res.json({ ...rows[0], planName: assignment.plan_name, quotaType: assignment.quota_type });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── Bundle Management ────────────────────────────────────────────────────────
+// A bundle is a paid top-up that does NOT reset the billing period — unlike
+// re-assigning the plan, it stacks on top of the current period's allowance.
 router.post('/bundles', async (req, res) => {
   try {
-    const { userId, companyId, quotaTokens, expiresAt, note } = req.body;
-    if ((!userId && !companyId) || !quotaTokens || quotaTokens <= 0) return res.status(400).json({ error: 'userId or companyId, and quotaTokens > 0 required' });
+    const { userId, companyId, quotaTokens, quotaMessages, expiresAt, note } = req.body;
+    if (!userId && !companyId) return res.status(400).json({ error: 'userId or companyId required' });
+
+    // Messages are the enforced unit on current plans; tokens remain for the
+    // legacy token-only plans. A top-up may carry either or both.
+    const tokens = quotaTokens !== undefined && quotaTokens !== null ? Number(quotaTokens) : 0;
+    const messages = quotaMessages !== undefined && quotaMessages !== null ? Number(quotaMessages) : null;
+    if (tokens <= 0 && !messages) {
+      return res.status(400).json({ error: 'quotaTokens > 0 or quotaMessages > 0 required' });
+    }
+    if (tokens < 0) return res.status(400).json({ error: 'quotaTokens cannot be negative' });
+    if (messages !== null && messages <= 0) return res.status(400).json({ error: 'quotaMessages must be > 0 when set' });
     if (expiresAt && new Date(expiresAt) <= new Date()) return res.status(400).json({ error: 'expiresAt must be in the future' });
 
     const { rows } = await dashboardPool.query(`
-      INSERT INTO llm_quota_bundles (id, user_id, company_id, quota_tokens, remaining_tokens, expires_at, note, created_at, updated_at)
-      VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5, NOW(), NOW()) RETURNING *
-    `, [userId || null, companyId || null, quotaTokens, expiresAt || null, note || null]);
+      INSERT INTO llm_quota_bundles (id, user_id, company_id, quota_tokens, remaining_tokens, quota_messages, expires_at, note, created_at, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5, $6, NOW(), NOW()) RETURNING *
+    `, [userId || null, companyId || null, tokens, messages, expiresAt || null, note || null]);
 
     await dashboardPool.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
       VALUES (gen_random_uuid(), $1, 'bundle.add', 'llm_quota_bundle', $2, $3, NOW())`,
-      [req.user.id, rows[0].id, JSON.stringify({ userId, companyId, quotaTokens, expiresAt, note })]);
+      [req.user.id, rows[0].id, JSON.stringify({ userId, companyId, quotaTokens: tokens, quotaMessages: messages, expiresAt, note })]);
 
-    res.status(201).json({ ...rows[0], quotaTokens: Number(rows[0].quota_tokens), remainingTokens: Number(rows[0].remaining_tokens) });
+    res.status(201).json({
+      ...rows[0],
+      quotaTokens: Number(rows[0].quota_tokens),
+      remainingTokens: Number(rows[0].remaining_tokens),
+      quotaMessages: rows[0].quota_messages !== null ? Number(rows[0].quota_messages) : null,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.get('/bundles/:userId', async (req, res) => {
   try {
+    // Company-scoped bundles are included because quota.js charges a member's
+    // overage to them — an admin inspecting one member has to see the shared
+    // balance that is actually being drawn down.
     const { rows } = await dashboardPool.query(`
-      SELECT * FROM llm_quota_bundles WHERE user_id = $1 ORDER BY created_at DESC
+      SELECT b.*, (b.user_id IS NULL AND b.company_id IS NOT NULL) AS is_company_bundle
+      FROM llm_quota_bundles b
+      WHERE b.user_id = $1
+         OR b.company_id = (SELECT company_id FROM llm_user_mappings WHERE user_id = $1)
+      ORDER BY b.created_at DESC
     `, [req.params.userId]);
-    res.json({ items: rows.map(r => ({ ...r, quotaTokens: Number(r.quota_tokens), remainingTokens: Number(r.remaining_tokens) })) });
+    res.json({ items: rows.map(r => ({
+      ...r,
+      quotaTokens: Number(r.quota_tokens),
+      remainingTokens: Number(r.remaining_tokens),
+      quotaMessages: r.quota_messages !== null ? Number(r.quota_messages) : null,
+      isCompanyBundle: r.is_company_bundle,
+    })) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -510,7 +674,8 @@ router.get('/aitm-companies', async (req, res) => {
     let planMap = {};
     if (companyIds.length > 0) {
       const { rows: plans } = await dashboardPool.query(`
-        SELECT a.company_id, p.name AS plan_name, p.quota_type, p.quota_tokens, p.quota_messages, a.starts_at, a.reset_at
+        SELECT a.id AS assignment_id, a.company_id, p.name AS plan_name, p.quota_type,
+               p.quota_tokens, p.quota_messages, p.max_members, a.starts_at, a.reset_at
         FROM llm_plan_assignments a
         JOIN llm_token_plans p ON p.id = a.plan_id
         WHERE a.company_id = ANY($1) AND a.is_active = true
@@ -527,10 +692,16 @@ router.get('/aitm-companies', async (req, res) => {
         hrAdminEmail: r.hr_admin_email,
         memberCount: Number(r.member_count),
         activePlan: planMap[r.id] ? {
+          assignmentId: planMap[r.id].assignment_id,
           name: planMap[r.id].plan_name,
           quotaType: planMap[r.id].quota_type,
           quotaTokens: Number(planMap[r.id].quota_tokens),
           quotaMessages: planMap[r.id].quota_messages !== null ? Number(planMap[r.id].quota_messages) : null,
+          maxMembers: planMap[r.id].max_members !== null ? Number(planMap[r.id].max_members) : null,
+          // member_count is AITM headcount — the same basis the cap is enforced on.
+          // Sitting exactly at the cap is still within tier.
+          overMemberCap: planMap[r.id].max_members !== null
+            && Number(r.member_count) > Number(planMap[r.id].max_members),
           startsAt: planMap[r.id].starts_at,
           resetAt: planMap[r.id].reset_at,
         } : null,
@@ -585,6 +756,17 @@ router.patch('/mappings/:userId/company', async (req, res) => {
   try {
     const { userId } = req.params;
     const { companyId } = req.body;
+
+    // Moving a member into a company already over its plan cap would grant agent
+    // access the tier does not cover, so block before touching the mapping.
+    if (companyId) {
+      const plan = await getActiveCompanyPlan(companyId);
+      if (plan) {
+        const capViolation = await checkMemberCap(companyId, plan);
+        if (capViolation) return res.status(409).json(capViolation);
+      }
+    }
+
     const { rows } = await dashboardPool.query(`
       INSERT INTO llm_user_mappings (id, user_id, company_id, created_at, updated_at)
       VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
@@ -592,7 +774,10 @@ router.patch('/mappings/:userId/company', async (req, res) => {
       RETURNING *
     `, [userId, companyId || null]);
 
-    await aitmPool.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+    // llm_audit_logs lives in the dashboard DB. This previously used aitmPool,
+    // which has no llm_* tables — so the write threw and 500'd the request after
+    // the mapping had already been committed.
+    await dashboardPool.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
       VALUES (gen_random_uuid(), $1, 'mapping.company', 'llm_user_mapping', $2, $3, NOW())`,
       [req.user.id, userId, JSON.stringify({ userId, companyId })]);
 

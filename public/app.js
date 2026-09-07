@@ -31,10 +31,16 @@ function fmtTokens(n) {
 function fmtCost(n, currency = 'IDR') {
   if (n === null || n === undefined) return '—';
   const num = parseFloat(n);
-  return 'Rp ' + num.toLocaleString('id-ID', {
+  if (isNaN(num)) return '—';
+  const digits = {
     minimumFractionDigits: num % 1 === 0 ? 0 : 2,
     maximumFractionDigits: 6
-  });
+  };
+  // Every registered service and plan is IDR today, but cost_currency is a real
+  // column — honour it so a USD-priced service cannot render as "Rp 0.25".
+  const cur = String(currency || 'IDR').toUpperCase();
+  if (cur === 'USD') return '$' + num.toLocaleString('en-US', digits);
+  return 'Rp ' + num.toLocaleString('id-ID', digits);
 }
 
 function fmtDate(d) {
@@ -853,11 +859,11 @@ async function renderPlansTab(tab) {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>${t('form_plan_name')}</th><th>${t('form_quota_type')}</th>
-          <th>${t('col_quota_tokens')}</th><th>Message Limit</th><th>${t('col_price')}</th>
+          <th>${t('col_quota_tokens')}</th><th>Message Limit</th><th>Max Members</th><th>${t('col_price')}</th>
           <th>Services & Limits</th>
           <th>${t('col_assignments')}</th><th>${t('col_active')}</th><th>${t('col_actions')}</th>
         </tr></thead>
-        <tbody id="plans-tbody"><tr><td colspan="9" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+        <tbody id="plans-tbody"><tr><td colspan="10" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
       </table></div>
     `;
     document.getElementById('btn-create-plan').addEventListener('click', () => showCreatePlanModal());
@@ -881,10 +887,10 @@ async function renderPlansTab(tab) {
   } else if (tab === 'bundles') {
     area.innerHTML = `
       <div class="section-header">
-        <div class="section-title">One-time Token Bundles</div>
+        <div class="section-title">One-time Bundles (Messages / Tokens)</div>
         <button class="btn btn-primary btn-sm" id="btn-add-bundle">+ ${t('btn_add_bundle')}</button>
       </div>
-      <p class="text-muted text-sm" style="margin-bottom:16px;">Add a one-time token bundle to a user. Bundles supplement their recurring plan.</p>
+      <p class="text-muted text-sm" style="margin-bottom:16px;">Paid top-ups that stack on the current period without resetting it. Enter messages for current plans, tokens for legacy token-enforced ones. To hand back the full allowance instead — a repeat demo or renewal — use Reset Period on the Companies tab.</p>
       <div class="card">
         <p class="text-muted text-sm">Select a user to view their bundles.</p>
       </div>
@@ -918,14 +924,22 @@ async function loadAitmCompanies() {
     const plan = c.activePlan
       ? `${c.activePlan.name}<div class="text-xs text-muted">${c.activePlan.quotaMessages !== null ? c.activePlan.quotaMessages + ' msg' : fmtTokens(c.activePlan.quotaTokens) + ' tok'} / ${c.activePlan.quotaType.toLowerCase()}</div>`
       : '<span class="text-muted">— none (trial auto) —</span>';
+    // memberCount is AITM headcount — the same basis the plan cap is enforced on
+    const cap = c.activePlan?.maxMembers ?? null;
+    const overCap = !!c.activePlan?.overMemberCap;
+    const members = cap !== null
+      ? `<span class="badge ${overCap ? 'badge-critical' : 'badge-healthy'}">${c.memberCount} / ${cap}</span>` +
+        (overCap ? '<div class="text-xs" style="color:var(--danger);">over cap — new assignments blocked</div>' : '')
+      : `<span class="badge badge-healthy">${c.memberCount}</span><div class="text-xs text-muted">unlimited</div>`;
     return `<tr>
       <td style="font-weight:600;">${c.name}</td>
-      <td><span class="badge badge-healthy">${c.memberCount}</span></td>
+      <td>${members}</td>
       <td>${admin}</td>
       <td>${plan}</td>
       <td style="white-space:nowrap;">
         <button class="btn btn-xs btn-ghost" onclick="showSetHrAdminModal('${c.id}')">Set HR Admin</button>
         <button class="btn btn-xs btn-ghost" onclick="showAssignPlanToCompanyModal('${c.id}')">Assign Plan</button>
+        ${c.activePlan ? `<button class="btn btn-xs btn-ghost" onclick="showResetPeriodModal('${c.activePlan.assignmentId}', '${c.id}')">Reset Period</button>` : ''}
       </td>
     </tr>`;
   }).join('') : `<tr><td colspan="5" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
@@ -966,6 +980,44 @@ window.showAssignPlanToCompanyModal = function(companyId) {
   pages.plans.showAssignModal(null, null, companyId);
 };
 
+// Restarts the current billing period on the same plan, which drops counted
+// message usage back to zero. For a repeat demo or a renewal — a paid top-up
+// that should sit on top of the existing period wants "Add Bundle" instead.
+window.showResetPeriodModal = async function(assignmentId, companyId) {
+  const data = await GET('/api/admin/aitm-companies').catch(() => null);
+  const company = (data?.items || []).find(c => c.id === companyId);
+  const plan = company?.activePlan;
+  const name = company?.name || 'this company';
+
+  modal.open(`Reset Quota Period — ${name}`, `
+    <p class="text-muted text-sm" style="margin-bottom:12px;">
+      Restarts the <strong>${plan?.name || 'current'}</strong> period from now, so the
+      ${plan?.quotaMessages !== null && plan?.quotaMessages !== undefined ? plan.quotaMessages + ' messages' : 'tokens'}
+      counted since ${plan ? fmtDateTime(plan.startsAt) : 'the period start'} drop back to zero.
+      The plan and its limits are unchanged.
+    </p>
+    <p class="text-muted text-sm" style="margin-bottom:16px;">
+      If the customer paid for <em>extra</em> messages on top of the period they already have, add a bundle
+      instead — resetting hands back the full allowance rather than extending it.
+    </p>
+    <div class="form-group"><label class="form-label">Reason (stored in the audit log)</label>
+      <input id="rp-reason" class="form-control" placeholder="e.g. second demo for procurement…" /></div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="rp-confirm">Reset Period</button>
+  `);
+
+  document.getElementById('rp-confirm').addEventListener('click', async () => {
+    const reason = document.getElementById('rp-reason').value.trim() || null;
+    try {
+      const res = await POST(`/api/admin/assignments/${assignmentId}/reset`, { reason });
+      modal.close();
+      showToast(`Period reset — ${res.planName} now runs to ${fmtDate(res.reset_at)}.`, 'success');
+      renderPlansTab('companies');
+    } catch (err) { showToast(err.message, 'error'); }
+  });
+};
+
 async function loadPlans() {
   const data = await GET('/api/admin/plans').catch(() => null);
   if (!data) return;
@@ -975,7 +1027,7 @@ async function loadPlans() {
       ? p.services.map(s => {
           let limitStr = [];
           if (s.hitLimitMonthly) limitStr.push(`${s.hitLimitMonthly} hits`);
-          if (s.costLimitMonthly) limitStr.push(`${fmtCost(s.costLimitMonthly)}`);
+          if (s.costLimitMonthly) limitStr.push(`${fmtCost(s.costLimitMonthly, s.costCurrency)}`);
           if (limitStr.length === 0) limitStr.push('Unlimited');
           return `<div style="font-size:11px; margin-bottom:2px;">• <strong>${s.displayName}</strong>: ${limitStr.join(' / ')}</div>`;
         }).join('')
@@ -986,13 +1038,14 @@ async function loadPlans() {
       <td>${t(p.quota_type?.toLowerCase()) || p.quota_type}</td>
       <td>${fmtTokens(p.quotaTokens)}</td>
       <td>${p.quotaMessages !== null && p.quotaMessages !== undefined ? `<span class="badge badge-healthy">${p.quotaMessages} / period</span>` : '<span class="text-muted">token-based</span>'}</td>
+      <td>${p.maxMembers !== null && p.maxMembers !== undefined ? `<span class="badge badge-healthy">${p.maxMembers}</span>` : '<span class="text-muted">unlimited</span>'}</td>
       <td>${p.price_amount ? fmtCost(p.price_amount/100, p.currency) : '—'}</td>
       <td>${servicesHTML}</td>
       <td><span class="badge badge-healthy">${p.assignmentCount} users</span></td>
       <td>${p.is_active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Inactive</span>'}</td>
       <td><button class="btn btn-xs btn-ghost" onclick="showEditPlanModal('${p.id}')">Edit</button></td>
     </tr>`;
-  }).join('') : `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
+  }).join('') : `<tr><td colspan="10" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
 }
 
 async function loadAssignments() {
@@ -1045,6 +1098,9 @@ async function showCreatePlanModal() {
     <div class="form-group"><label class="form-label">Message Limit / period (enforced)</label>
       <input id="mp-messages" type="number" class="form-control" placeholder="e.g. 20 — leave empty for token-only legacy plan" min="1" />
       <span class="text-xs text-muted" style="margin-top:4px; display:block;">When set, users are limited to this many chat messages per period; tokens keep being recorded for monitoring.</span></div>
+    <div class="form-group"><label class="form-label">Max Members (company headcount)</label>
+      <input id="mp-members" type="number" class="form-control" placeholder="e.g. 25 — leave empty for unlimited" min="1" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">Counts AITM employees at the company, not just agent-enabled members. Assigning this plan to a company already over the cap is blocked.</span></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Price (Rupiah)</label>
         <input id="mp-price" type="number" class="form-control" placeholder="e.g. 8000000" min="0" /></div>
@@ -1077,6 +1133,8 @@ async function showCreatePlanModal() {
     const quotaTokens = parseInt(document.getElementById('mp-tokens').value);
     const quotaMessagesVal = document.getElementById('mp-messages').value;
     const quotaMessages = quotaMessagesVal ? parseInt(quotaMessagesVal) : null;
+    const maxMembersVal = document.getElementById('mp-members').value;
+    const maxMembers = maxMembersVal ? parseInt(maxMembersVal) : null;
     const priceAmountVal = parseFloat(document.getElementById('mp-price').value) || 0;
     const description = document.getElementById('mp-desc').value.trim();
 
@@ -1100,6 +1158,7 @@ async function showCreatePlanModal() {
         quotaType,
         quotaTokens,
         quotaMessages,
+        maxMembers,
         priceAmount: Math.round(priceAmountVal * 100),
         currency: 'IDR',
         description,
@@ -1166,6 +1225,9 @@ window.showEditPlanModal = async function(planId) {
     <div class="form-group"><label class="form-label">Message Limit / period (enforced)</label>
       <input id="ep-messages" type="number" class="form-control" value="${plan.quotaMessages ?? ''}" placeholder="empty = token-only legacy plan" min="1" />
       <span class="text-xs text-muted" style="margin-top:4px; display:block;">Clear the value to switch the plan back to token-only enforcement.</span></div>
+    <div class="form-group"><label class="form-label">Max Members (company headcount)</label>
+      <input id="ep-members" type="number" class="form-control" value="${plan.maxMembers ?? ''}" placeholder="empty = unlimited" min="1" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">Counts AITM employees. Lowering this below a company's current headcount blocks new plan assignments and member mappings for that company.</span></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Price (Rupiah)</label>
         <input id="ep-price" type="number" class="form-control" value="${plan.price_amount ? (plan.price_amount / 100) : ''}" placeholder="e.g. 8000000" min="0" /></div>
@@ -1202,6 +1264,8 @@ window.showEditPlanModal = async function(planId) {
     const quotaTokens = parseInt(document.getElementById('ep-tokens').value);
     const quotaMessagesVal = document.getElementById('ep-messages').value;
     const quotaMessages = quotaMessagesVal ? parseInt(quotaMessagesVal) : null;
+    const maxMembersVal = document.getElementById('ep-members').value;
+    const maxMembers = maxMembersVal ? parseInt(maxMembersVal) : null;
     const priceAmountVal = parseFloat(document.getElementById('ep-price').value) || 0;
     const description = document.getElementById('ep-desc').value.trim();
     const isActive = document.getElementById('ep-active').checked;
@@ -1225,6 +1289,7 @@ window.showEditPlanModal = async function(planId) {
         name,
         quotaTokens,
         quotaMessages,
+        maxMembers,
         priceAmount: Math.round(priceAmountVal * 100),
         currency: 'IDR',
         description,
@@ -1326,8 +1391,12 @@ pages.plans.showBundleModal = async function(userId, userName) {
       <select id="bun-company" class="form-control">
         ${companies.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
       </select></div>
+    <div class="form-group"><label class="form-label">Bundle Message Quota</label>
+      <input id="bun-messages" type="number" class="form-control" placeholder="e.g. 50 — leave empty if not a message top-up" min="1" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">Paid top-up for plans that enforce messages. Drawn after the plan allowance, earliest expiry first, and it does not reset the billing period.</span></div>
     <div class="form-group"><label class="form-label">${t('form_quota_tokens_bundle') || 'Bundle Token Quota'}</label>
-      <input id="bun-tokens" type="number" class="form-control" placeholder="100000" min="1" /></div>
+      <input id="bun-tokens" type="number" class="form-control" placeholder="100000 — leave empty if not a token top-up" min="0" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">Only needed for legacy token-enforced plans.</span></div>
     <div class="form-group"><label class="form-label">${t('form_expires_at') || 'Expires At'}</label>
       <input id="bun-exp" type="date" class="form-control" /></div>
     <div class="form-group"><label class="form-label">${t('form_note') || 'Note'}</label>
@@ -1354,16 +1423,19 @@ pages.plans.showBundleModal = async function(userId, userName) {
     const isUser = targetType.value === 'user';
     const uid = isUser ? document.getElementById('bun-user').value : null;
     const cid = !isUser ? document.getElementById('bun-company').value : null;
-    const tokens = parseInt(document.getElementById('bun-tokens').value);
+    const tokensVal = document.getElementById('bun-tokens').value;
+    const tokens = tokensVal ? parseInt(tokensVal) : 0;
+    const messagesVal = document.getElementById('bun-messages').value;
+    const messages = messagesVal ? parseInt(messagesVal) : null;
     const exp = document.getElementById('bun-exp').value;
     const note = document.getElementById('bun-note').value.trim();
 
     if (isUser && !uid) return showToast('Please select a user', 'error');
     if (!isUser && !cid) return showToast('Please select a company', 'error');
-    if (!tokens || tokens <= 0) return showToast('Please enter a valid token count', 'error');
+    if (!(tokens > 0) && !(messages > 0)) return showToast('Enter a message quota, a token quota, or both', 'error');
 
     try {
-      await POST('/api/admin/bundles', { userId: uid, companyId: cid, quotaTokens: tokens, expiresAt: exp || null, note });
+      await POST('/api/admin/bundles', { userId: uid, companyId: cid, quotaTokens: tokens, quotaMessages: messages, expiresAt: exp || null, note });
       modal.close(); showToast(t('bundle_added') || 'Bundle added successfully', 'success');
       renderPlansTab('bundles');
     } catch (err) { showToast(err.message, 'error'); }

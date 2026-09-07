@@ -22,6 +22,7 @@ model LlmTokenPlan {
   quotaType     String   @map("quota_type") // MONTHLY | YEARLY
   quotaTokens   BigInt   @map("quota_tokens")
   quotaMessages Int?     @map("quota_messages") // enforced limit unit; tokens stay for monitoring
+  maxMembers    Int?     @map("max_members") // tier cap on AITM employee headcount; null = unlimited
   priceAmount   BigInt   @default(0) @map("price_amount")
   currency    String   @default("IDR")
   description String?
@@ -57,7 +58,7 @@ model LlmPlanAssignment {
 // ─── One-Time Quota Bundles ───────────────────────────────────────────────────
 model LlmQuotaBundle {
   id              String    @id @default(uuid())
-  userId          String    @map("user_id")
+  userId          String?   @map("user_id") // null for a company-scoped shared balance
   companyId       String?   @map("company_id")
   quotaTokens     BigInt    @map("quota_tokens")
   remainingTokens BigInt    @map("remaining_tokens")
@@ -68,6 +69,7 @@ model LlmQuotaBundle {
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
   @@index([userId])
+  @@index([companyId])
   @@map("llm_quota_bundles")
 }
 

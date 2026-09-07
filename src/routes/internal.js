@@ -72,6 +72,14 @@ router.post('/preflight', async (req, res) => {
       availableTokens:          result.available,
       remainingRecurringTokens: result.remainingRecurringTokens,
       remainingBundleTokens:    result.remainingBundleTokens,
+      // Message-quota state, so callers can drive their own warning thresholds
+      // without a second round trip to /quota-summary.
+      hasMessageQuota:          !!result.hasMessageQuota,
+      usedMessages:             result.usedMessages ?? 0,
+      planMessages:             result.planMessages ?? null,
+      totalRemainingMessages:   result.totalRemainingMessages ?? null,
+      periodEnd:                result.periodEnd || null,
+      windows:                  result.windows || null,
     });
   } catch (err) {
     console.error('[Internal] POST /preflight error:', err.message);

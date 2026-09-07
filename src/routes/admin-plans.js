@@ -31,6 +31,7 @@ router.get('/plans', async (req, res) => {
       items.push({
         ...r,
         quotaTokens: Number(r.quota_tokens),
+        quotaMessages: r.quota_messages !== null && r.quota_messages !== undefined ? Number(r.quota_messages) : null,
         assignmentCount: Number(r.assignment_count),
         services: svcs.map(s => ({
           serviceId: s.service_id,
@@ -49,7 +50,7 @@ router.post('/plans', async (req, res) => {
   const client = await dashboardPool.connect();
   try {
     await client.query('BEGIN');
-    const { name, quotaType, quotaTokens, priceAmount = 0, currency = 'IDR', description, isActive = true, services = [] } = req.body;
+    const { name, quotaType, quotaTokens, quotaMessages, priceAmount = 0, currency = 'IDR', description, isActive = true, services = [] } = req.body;
     if (!name || !quotaType || !quotaTokens) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'name, quotaType, quotaTokens required' });
@@ -62,12 +63,16 @@ router.post('/plans', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'quotaTokens must be > 0' });
     }
+    if (quotaMessages !== undefined && quotaMessages !== null && quotaMessages <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'quotaMessages must be > 0 when set' });
+    }
 
     const { rows } = await client.query(`
-      INSERT INTO llm_token_plans (id, name, quota_type, quota_tokens, price_amount, currency, description, is_active, created_at, updated_at)
-      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      INSERT INTO llm_token_plans (id, name, quota_type, quota_tokens, quota_messages, price_amount, currency, description, is_active, created_at, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       RETURNING *
-    `, [name, quotaType, quotaTokens, priceAmount, currency, description || null, isActive]);
+    `, [name, quotaType, quotaTokens, quotaMessages ?? null, priceAmount, currency, description || null, isActive]);
 
     const plan = rows[0];
     plan.services = [];
@@ -103,7 +108,7 @@ router.patch('/plans/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { id } = req.params;
-    const { name, quotaTokens, priceAmount, currency, description, isActive, services } = req.body;
+    const { name, quotaTokens, quotaMessages, priceAmount, currency, description, isActive, services } = req.body;
 
     const existing = await client.query(`SELECT * FROM llm_token_plans WHERE id = $1`, [id]);
     if (existing.rows.length === 0) {
@@ -111,7 +116,7 @@ router.patch('/plans/:id', async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     }
 
-    const { rows } = await client.query(`
+    let { rows } = await client.query(`
       UPDATE llm_token_plans
       SET name = COALESCE($1, name),
           quota_tokens = COALESCE($2, quota_tokens),
@@ -122,6 +127,17 @@ router.patch('/plans/:id', async (req, res) => {
           updated_at = NOW()
       WHERE id = $7 RETURNING *
     `, [name, quotaTokens, priceAmount, currency, description, isActive, id]);
+
+    // quota_messages must be settable back to NULL, so COALESCE cannot be used
+    if ('quotaMessages' in req.body) {
+      if (quotaMessages !== null && quotaMessages !== undefined && quotaMessages <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'quotaMessages must be > 0 when set' });
+      }
+      rows = (await client.query(`
+        UPDATE llm_token_plans SET quota_messages = $1, updated_at = NOW() WHERE id = $2 RETURNING *
+      `, [quotaMessages ?? null, id])).rows;
+    }
 
     if (services && Array.isArray(services)) {
       await client.query(`DELETE FROM llm_plan_services WHERE plan_id = $1`, [id]);
@@ -343,16 +359,39 @@ router.get('/mappings/goclaw-contacts', async (req, res) => {
 router.post('/throttle/reset/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { readGoclawConfig, writeGoclawConfig, reloadGoclaw } = require('../services/throttle');
-    const mappingRes = await dashboardPool.query(`SELECT goclaw_sender_id FROM llm_user_mappings WHERE user_id = $1`, [userId]);
-    if (mappingRes.rows.length && mappingRes.rows[0].goclaw_sender_id) {
-      const senderId = mappingRes.rows[0].goclaw_sender_id;
-      const config = readGoclawConfig();
-      delete config.gateway?.quota?.groups?.[`user:${senderId}`];
-      writeGoclawConfig(config);
-      reloadGoclaw();
+    const { readGoclawConfig, writeGoclawConfig, THROTTLE_MODE, GOCLAW_CONFIG } = require('../services/throttle');
+
+    if (THROTTLE_MODE !== 'enforce') {
+      return res.json({
+        ok: true,
+        enforced: false,
+        message: `Nothing to reset — channel enforcement runs in "${THROTTLE_MODE}" mode, so no GoClaw quota group is written. Web chat is limited per request by the AITM backend preflight.`,
+      });
     }
-    res.json({ ok: true, message: 'Throttle reset' });
+
+    const mappingRes = await dashboardPool.query(`SELECT goclaw_sender_id FROM llm_user_mappings WHERE user_id = $1`, [userId]);
+    const senderId = mappingRes.rows[0]?.goclaw_sender_id;
+    if (!senderId) return res.status(404).json({ error: 'User has no GoClaw sender id' });
+
+    const config = readGoclawConfig();
+    const groups = config.gateway?.quota?.groups;
+    if (!groups) {
+      return res.json({ ok: true, enforced: true, changed: false, message: 'No quota groups in the GoClaw config — nothing to reset.' });
+    }
+
+    // v3.14 keys groups by the raw sender id; also clear legacy `user:` keys
+    delete groups[senderId];
+    delete groups[`user:${senderId}`];
+    writeGoclawConfig(config);
+
+    res.json({
+      ok: true,
+      enforced: true,
+      changed: true,
+      requiresRestart: true,
+      configPath: GOCLAW_CONFIG,
+      message: 'Quota group removed — restart the GoClaw container to apply (v3.14 has no hot reload for quota).',
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -447,6 +486,97 @@ router.get('/companies/:id/members', async (req, res) => {
       goclaw_display_name: mapDict[u.user_id]?.goclaw_display_name || null,
     }));
     res.json({ items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AITM Companies (HR admin designation + plan overview) ───────────────────
+// The AITM companies table is the single source of truth for company identity
+// and the HR admin; llm_companies mirrors it (same id) for plan assignments.
+router.get('/aitm-companies', async (req, res) => {
+  try {
+    const { rows } = await aitmPool.query(`
+      SELECT
+        c.id, c.name, c."hrAdminId" AS hr_admin_id,
+        admin_u.name AS hr_admin_name, admin_u.email AS hr_admin_email,
+        COUNT(e.id) AS member_count
+      FROM companies c
+      LEFT JOIN users admin_u ON admin_u.id = c."hrAdminId"
+      LEFT JOIN employees e ON e.company_id = c.id
+      GROUP BY c.id, c.name, c."hrAdminId", admin_u.name, admin_u.email
+      ORDER BY c.name
+    `);
+
+    const companyIds = rows.map(r => r.id);
+    let planMap = {};
+    if (companyIds.length > 0) {
+      const { rows: plans } = await dashboardPool.query(`
+        SELECT a.company_id, p.name AS plan_name, p.quota_type, p.quota_tokens, p.quota_messages, a.starts_at, a.reset_at
+        FROM llm_plan_assignments a
+        JOIN llm_token_plans p ON p.id = a.plan_id
+        WHERE a.company_id = ANY($1) AND a.is_active = true
+      `, [companyIds]);
+      for (const p of plans) planMap[p.company_id] = p;
+    }
+
+    res.json({
+      items: rows.map(r => ({
+        id: r.id,
+        name: r.name,
+        hrAdminId: r.hr_admin_id,
+        hrAdminName: r.hr_admin_name,
+        hrAdminEmail: r.hr_admin_email,
+        memberCount: Number(r.member_count),
+        activePlan: planMap[r.id] ? {
+          name: planMap[r.id].plan_name,
+          quotaType: planMap[r.id].quota_type,
+          quotaTokens: Number(planMap[r.id].quota_tokens),
+          quotaMessages: planMap[r.id].quota_messages !== null ? Number(planMap[r.id].quota_messages) : null,
+          startsAt: planMap[r.id].starts_at,
+          resetAt: planMap[r.id].reset_at,
+        } : null,
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/aitm-companies/:id/employees', async (req, res) => {
+  try {
+    const { rows } = await aitmPool.query(`
+      SELECT u.id AS user_id, u.name, u.email, ur.role_name AS role
+      FROM employees e
+      JOIN users u ON u.id = e.user_id
+      JOIN user_roles ur ON ur.id = e.user_role_id
+      WHERE e.company_id = $1
+      ORDER BY u.name
+    `, [req.params.id]);
+    res.json({ items: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.patch('/aitm-companies/:id/hr-admin', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const empRes = await aitmPool.query(`
+      SELECT id FROM employees WHERE user_id = $1 AND company_id = $2
+    `, [userId, id]);
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User is not an employee of this company' });
+    }
+
+    const { rows } = await aitmPool.query(`
+      UPDATE companies SET "hrAdminId" = $1, updated_at = NOW() WHERE id = $2 RETURNING id, name, "hrAdminId"
+    `, [userId, id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Company not found' });
+
+    await dashboardPool.query(`
+      INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'company.hr_admin.set', 'aitm_company', $2, $3, NOW())
+    `, [req.user.id, id, JSON.stringify({ hrAdminId: userId })]);
+
+    res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

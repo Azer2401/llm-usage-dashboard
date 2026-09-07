@@ -17,11 +17,12 @@ datasource db {
 // ─── LLM Token Plans ──────────────────────────────────────────────────────────
 // Recurring quota plans (MONTHLY or YEARLY)
 model LlmTokenPlan {
-  id          String   @id @default(uuid())
-  name        String   @unique
-  quotaType   String   @map("quota_type") // MONTHLY | YEARLY
-  quotaTokens BigInt   @map("quota_tokens")
-  priceAmount BigInt   @default(0) @map("price_amount")
+  id            String   @id @default(uuid())
+  name          String   @unique
+  quotaType     String   @map("quota_type") // MONTHLY | YEARLY
+  quotaTokens   BigInt   @map("quota_tokens")
+  quotaMessages Int?     @map("quota_messages") // enforced limit unit; tokens stay for monitoring
+  priceAmount   BigInt   @default(0) @map("price_amount")
   currency    String   @default("IDR")
   description String?
   isActive    Boolean  @default(true) @map("is_active")
@@ -60,6 +61,7 @@ model LlmQuotaBundle {
   companyId       String?   @map("company_id")
   quotaTokens     BigInt    @map("quota_tokens")
   remainingTokens BigInt    @map("remaining_tokens")
+  quotaMessages   Int?      @map("quota_messages") // message top-up; consumed statelessly after plan
   expiresAt       DateTime? @map("expires_at")
   note            String?
   createdAt       DateTime  @default(now()) @map("created_at")
@@ -141,6 +143,21 @@ model LlmCompany {
   updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@map("llm_companies")
+}
+
+// ─── Company Message Limits ───────────────────────────────────────────────────
+// HR-admin configurable rolling windows (5 hours / 1 week), counted per member.
+// Enforced by preflightCheck alongside the plan message quota.
+model LlmCompanyMessageLimit {
+  companyId       String   @id @map("company_id")
+  fiveHourEnabled Boolean  @default(false) @map("five_hour_enabled")
+  fiveHourLimit   Int?     @map("five_hour_limit")
+  weekEnabled     Boolean  @default(false) @map("week_enabled")
+  weekLimit       Int?     @map("week_limit")
+  updatedBy       String?  @map("updated_by")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("llm_company_message_limits")
 }
 
 // ─── Plan Services ────────────────────────────────────────────────────────────

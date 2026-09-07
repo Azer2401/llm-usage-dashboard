@@ -3,7 +3,7 @@
 const { Router } = require('express');
 const { requireAuth, requireHRorHM } = require('../auth');
 const { dashboardPool } = require('../db');
-const { getUserQuotaSummary } = require('../services/quota');
+const { getUserQuotaSummary, findWindowViolation } = require('../services/quota');
 
 const router = Router();
 router.use(requireAuth, requireHRorHM);
@@ -26,15 +26,21 @@ router.get('/summary', async (req, res) => {
       WHERE user_id = $1 AND created_at >= $2
     `, [userId, periodFrom]);
 
-    // Quota status badge
+    // Quota status badge (messages are the enforcement unit when the plan defines them)
     const pct = summary.planQuota > 0 ? (summary.usedRecurringTokens / summary.planQuota) * 100 : 0;
+    const enforcedPct = summary.hasMessageQuota
+      ? (summary.planMessages > 0 ? (summary.usedMessages / summary.planMessages) * 100 : 0)
+      : pct;
+    const enforcedRemaining = summary.hasMessageQuota ? summary.totalRemainingMessages : summary.totalRemainingTokens;
     let quotaStatus = 'NO_PLAN';
-    if (summary.planQuota > 0 || summary.remainingBundleTokens > 0) {
-      if (summary.totalRemainingTokens === 0) quotaStatus = 'EXHAUSTED';
-      else if (pct >= 90) quotaStatus = 'CRITICAL';
-      else if (pct >= 70) quotaStatus = 'WARNING';
+    if (summary.hasMessageQuota || summary.planQuota > 0 || summary.remainingBundleTokens > 0) {
+      if (enforcedRemaining <= 0) quotaStatus = 'EXHAUSTED';
+      else if (enforcedPct >= 90) quotaStatus = 'CRITICAL';
+      else if (enforcedPct >= 70) quotaStatus = 'WARNING';
       else quotaStatus = 'HEALTHY';
     }
+    // A rolling-window block outranks the plan badge: the member cannot send now
+    if (findWindowViolation(summary.windows)) quotaStatus = 'EXHAUSTED';
 
     const usage = usageRes.rows[0];
     res.json({
@@ -55,6 +61,15 @@ router.get('/summary', async (req, res) => {
         usagePercentage:          Math.min(100, Math.round(pct)),
         quotaStatus,
       },
+      messages: {
+        hasQuota:        summary.hasMessageQuota,
+        used:            summary.usedMessages,
+        planQuota:       summary.planMessages,
+        totalRemaining:  summary.totalRemainingMessages,
+        periodStart:     summary.periodStart ? summary.periodStart.toISOString() : null,
+        periodEnd:       summary.periodEnd ? summary.periodEnd.toISOString() : null,
+      },
+      windows: summary.windows,
       bundles: summary.bundles.map(b => ({
         id:              b.id,
         quotaTokens:     Number(b.quota_tokens),

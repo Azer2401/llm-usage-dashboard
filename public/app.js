@@ -826,6 +826,7 @@ pages.plans = async function() {
       <button class="inner-tab active" data-tab="plans">${t('tab_plans')}</button>
       <button class="inner-tab" data-tab="assignments">${t('tab_assignments')}</button>
       <button class="inner-tab" data-tab="bundles">${t('tab_bundles')}</button>
+      <button class="inner-tab" data-tab="companies">Companies</button>
     </div>
     <div id="plans-tab-content"></div>
   `;
@@ -852,11 +853,11 @@ async function renderPlansTab(tab) {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>${t('form_plan_name')}</th><th>${t('form_quota_type')}</th>
-          <th>${t('col_quota_tokens')}</th><th>${t('col_price')}</th>
+          <th>${t('col_quota_tokens')}</th><th>Message Limit</th><th>${t('col_price')}</th>
           <th>Services & Limits</th>
           <th>${t('col_assignments')}</th><th>${t('col_active')}</th><th>${t('col_actions')}</th>
         </tr></thead>
-        <tbody id="plans-tbody"><tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+        <tbody id="plans-tbody"><tr><td colspan="9" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
       </table></div>
     `;
     document.getElementById('btn-create-plan').addEventListener('click', () => showCreatePlanModal());
@@ -889,8 +890,81 @@ async function renderPlansTab(tab) {
       </div>
     `;
     document.getElementById('btn-add-bundle').addEventListener('click', () => pages.plans.showBundleModal());
+  } else if (tab === 'companies') {
+    area.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Companies (HR Admin & Plans)</div>
+        <button class="btn btn-ghost btn-sm" id="btn-refresh-companies">↻ Refresh</button>
+      </div>
+      <p class="text-muted text-sm" style="margin-bottom:16px;">Designate the HR admin per company and assign the company plan. The HR admin then manages members from the talent app; members share the company message quota.</p>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Company</th><th>Members</th><th>HR Admin</th><th>Active Plan</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="aitm-companies-tbody"><tr><td colspan="5" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+      </table></div>
+    `;
+    document.getElementById('btn-refresh-companies').addEventListener('click', () => loadAitmCompanies());
+    loadAitmCompanies();
   }
 }
+
+async function loadAitmCompanies() {
+  const data = await GET('/api/admin/aitm-companies').catch(() => null);
+  const tbody = document.getElementById('aitm-companies-tbody');
+  if (!data) { if (tbody) tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:40px; color:var(--text-muted);">Failed to load.</td></tr>'; return; }
+  tbody.innerHTML = data.items?.length ? data.items.map(c => {
+    const admin = c.hrAdminName ? `${c.hrAdminName}<div class="text-xs text-muted">${c.hrAdminEmail}</div>` : '<span class="text-muted">— not set —</span>';
+    const plan = c.activePlan
+      ? `${c.activePlan.name}<div class="text-xs text-muted">${c.activePlan.quotaMessages !== null ? c.activePlan.quotaMessages + ' msg' : fmtTokens(c.activePlan.quotaTokens) + ' tok'} / ${c.activePlan.quotaType.toLowerCase()}</div>`
+      : '<span class="text-muted">— none (trial auto) —</span>';
+    return `<tr>
+      <td style="font-weight:600;">${c.name}</td>
+      <td><span class="badge badge-healthy">${c.memberCount}</span></td>
+      <td>${admin}</td>
+      <td>${plan}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-xs btn-ghost" onclick="showSetHrAdminModal('${c.id}')">Set HR Admin</button>
+        <button class="btn btn-xs btn-ghost" onclick="showAssignPlanToCompanyModal('${c.id}')">Assign Plan</button>
+      </td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="5" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
+}
+
+window.showSetHrAdminModal = async function(companyId) {
+  const [companiesData, employeesData] = await Promise.all([
+    GET('/api/admin/aitm-companies').catch(() => ({ items: [] })),
+    GET(`/api/admin/aitm-companies/${companyId}/employees`).catch(() => ({ items: [] })),
+  ]);
+  const company = (companiesData.items || []).find(c => c.id === companyId);
+  const employees = employeesData.items || [];
+  if (!company) return showToast('Company not found', 'error');
+  if (!employees.length) return showToast('Company has no employees in AITM', 'error');
+
+  modal.open(`Set HR Admin — ${company.name}`, `
+    <p class="text-muted text-sm" style="margin-bottom:12px;">The HR admin sees the Company Config page (white-label + user management) in the talent app and receives the member usage overview.</p>
+    <div class="form-group"><label class="form-label">HR Admin</label>
+      <select id="ha-user" class="form-control">
+        ${employees.map(e => `<option value="${e.user_id}" ${e.user_id === company.hrAdminId ? 'selected' : ''}>${e.name} — ${e.email} (${e.role})</option>`).join('')}
+      </select></div>
+  `, `
+    <button class="btn btn-ghost" onclick="modal.close()">${t('cancel')}</button>
+    <button class="btn btn-primary" id="ha-save">${t('save')}</button>
+  `);
+
+  document.getElementById('ha-save').addEventListener('click', async () => {
+    const userId = document.getElementById('ha-user').value;
+    try {
+      await PATCH(`/api/admin/aitm-companies/${companyId}/hr-admin`, { userId });
+      modal.close(); showToast('HR admin updated.', 'success');
+      renderPlansTab('companies');
+    } catch (err) { showToast(err.message, 'error'); }
+  });
+};
+
+window.showAssignPlanToCompanyModal = function(companyId) {
+  pages.plans.showAssignModal(null, null, companyId);
+};
 
 async function loadPlans() {
   const data = await GET('/api/admin/plans').catch(() => null);
@@ -911,6 +985,7 @@ async function loadPlans() {
       <td style="font-weight:600;">${p.name}</td>
       <td>${t(p.quota_type?.toLowerCase()) || p.quota_type}</td>
       <td>${fmtTokens(p.quotaTokens)}</td>
+      <td>${p.quotaMessages !== null && p.quotaMessages !== undefined ? `<span class="badge badge-healthy">${p.quotaMessages} / period</span>` : '<span class="text-muted">token-based</span>'}</td>
       <td>${p.price_amount ? fmtCost(p.price_amount/100, p.currency) : '—'}</td>
       <td>${servicesHTML}</td>
       <td><span class="badge badge-healthy">${p.assignmentCount} users</span></td>
@@ -967,6 +1042,9 @@ async function showCreatePlanModal() {
         <select id="mp-type" class="form-control"><option value="MONTHLY">${t('monthly')}</option><option value="YEARLY">${t('yearly')}</option></select></div>
       <div class="form-group"><label class="form-label">${t('form_quota_tokens')}</label><input id="mp-tokens" type="number" class="form-control" placeholder="100000000" min="1" /></div>
     </div>
+    <div class="form-group"><label class="form-label">Message Limit / period (enforced)</label>
+      <input id="mp-messages" type="number" class="form-control" placeholder="e.g. 20 — leave empty for token-only legacy plan" min="1" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">When set, users are limited to this many chat messages per period; tokens keep being recorded for monitoring.</span></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Price (Rupiah)</label>
         <input id="mp-price" type="number" class="form-control" placeholder="e.g. 8000000" min="0" /></div>
@@ -997,6 +1075,8 @@ async function showCreatePlanModal() {
     const name = document.getElementById('mp-name').value.trim();
     const quotaType = document.getElementById('mp-type').value;
     const quotaTokens = parseInt(document.getElementById('mp-tokens').value);
+    const quotaMessagesVal = document.getElementById('mp-messages').value;
+    const quotaMessages = quotaMessagesVal ? parseInt(quotaMessagesVal) : null;
     const priceAmountVal = parseFloat(document.getElementById('mp-price').value) || 0;
     const description = document.getElementById('mp-desc').value.trim();
 
@@ -1019,6 +1099,7 @@ async function showCreatePlanModal() {
         name,
         quotaType,
         quotaTokens,
+        quotaMessages,
         priceAmount: Math.round(priceAmountVal * 100),
         currency: 'IDR',
         description,
@@ -1082,6 +1163,9 @@ window.showEditPlanModal = async function(planId) {
       <div class="form-group"><label class="form-label">${t('form_quota_tokens')}</label>
         <input id="ep-tokens" type="number" class="form-control" value="${plan.quotaTokens || plan.quota_tokens || 0}" min="1" /></div>
     </div>
+    <div class="form-group"><label class="form-label">Message Limit / period (enforced)</label>
+      <input id="ep-messages" type="number" class="form-control" value="${plan.quotaMessages ?? ''}" placeholder="empty = token-only legacy plan" min="1" />
+      <span class="text-xs text-muted" style="margin-top:4px; display:block;">Clear the value to switch the plan back to token-only enforcement.</span></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Price (Rupiah)</label>
         <input id="ep-price" type="number" class="form-control" value="${plan.price_amount ? (plan.price_amount / 100) : ''}" placeholder="e.g. 8000000" min="0" /></div>
@@ -1116,6 +1200,8 @@ window.showEditPlanModal = async function(planId) {
   document.getElementById('ep-save').addEventListener('click', async () => {
     const name = document.getElementById('ep-name').value.trim();
     const quotaTokens = parseInt(document.getElementById('ep-tokens').value);
+    const quotaMessagesVal = document.getElementById('ep-messages').value;
+    const quotaMessages = quotaMessagesVal ? parseInt(quotaMessagesVal) : null;
     const priceAmountVal = parseFloat(document.getElementById('ep-price').value) || 0;
     const description = document.getElementById('ep-desc').value.trim();
     const isActive = document.getElementById('ep-active').checked;
@@ -1138,6 +1224,7 @@ window.showEditPlanModal = async function(planId) {
       await PATCH(`/api/admin/plans/${planId}`, {
         name,
         quotaTokens,
+        quotaMessages,
         priceAmount: Math.round(priceAmountVal * 100),
         currency: 'IDR',
         description,
@@ -1150,7 +1237,7 @@ window.showEditPlanModal = async function(planId) {
   });
 };
 
-pages.plans.showAssignModal = async function(userId, userName) {
+pages.plans.showAssignModal = async function(userId, userName, presetCompanyId) {
   // Load users, companies and plans
   const [usersData, companiesData, plansData] = await Promise.all([
     GET('/api/admin/users?take=50').catch(() => ({ items: [] })),
@@ -1160,24 +1247,25 @@ pages.plans.showAssignModal = async function(userId, userName) {
   const hrUsers = (usersData.items || []).filter(u => u.role !== 'CANDIDATE');
   const companies = (companiesData.items || []).filter(c => c.is_active);
   const plans = (plansData.items || []).filter(p => p.is_active);
+  const planLabel = p => `${p.name} (${p.quotaMessages !== null && p.quotaMessages !== undefined ? p.quotaMessages + ' msg' : fmtTokens(p.quotaTokens) + ' tok'} / ${p.quota_type.toLowerCase()})`;
 
   modal.open(t('btn_assign') || 'Assign Plan', `
     <div class="form-group"><label class="form-label">Assignment Target</label>
       <select id="as-target-type" class="form-control">
-        <option value="user">Individual User</option>
-        <option value="company">Shared Company Quota</option>
+        <option value="user" ${presetCompanyId ? '' : 'selected'}>Individual User</option>
+        <option value="company" ${presetCompanyId ? 'selected' : ''}>Shared Company Quota</option>
       </select></div>
-    <div class="form-group" id="as-user-wrap"><label class="form-label">${t('form_select_user') || 'Select User'}</label>
+    <div class="form-group" id="as-user-wrap" style="${presetCompanyId ? 'display:none;' : ''}"><label class="form-label">${t('form_select_user') || 'Select User'}</label>
       <select id="as-user" class="form-control">
         ${hrUsers.map(u => `<option value="${u.userId}" ${u.userId === userId ? 'selected' : ''}>${u.name} (${u.role})</option>`).join('')}
       </select></div>
-    <div class="form-group" id="as-company-wrap" style="display:none;"><label class="form-label">Select Company</label>
+    <div class="form-group" id="as-company-wrap" style="${presetCompanyId ? '' : 'display:none;'}"><label class="form-label">Select Company</label>
       <select id="as-company" class="form-control">
-        ${companies.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+        ${companies.map(c => `<option value="${c.id}" ${c.id === presetCompanyId ? 'selected' : ''}>${c.name}</option>`).join('')}
       </select></div>
     <div class="form-group"><label class="form-label">${t('form_select_plan') || 'Select Plan'}</label>
       <select id="as-plan" class="form-control">
-        ${plans.map(p => `<option value="${p.id}">${p.name} (${fmtTokens(p.quotaTokens)} ${p.quota_type})</option>`).join('')}
+        ${plans.map(p => `<option value="${p.id}">${planLabel(p)}</option>`).join('')}
       </select></div>
     <div class="quota-banner warning" style="margin-top:8px;">⚠️ ${t('warning_replace_plan') || 'Assigning a new plan will deactivate any active plan for this target.'}</div>
   `, `
@@ -1770,7 +1858,12 @@ window.showEditCompanyModal = function(compId, name, desc, isActive) {
 window.runThrottleCheck = async function() {
   try {
     const res = await POST('/api/admin/throttle/run', {});
-    if (res) showToast(`${t('throttle_run_ok') || 'Throttle check completed.'} ${res.actions?.length || 0} actions.`, 'success');
+    if (!res) return;
+    const n = res.actions?.length || 0;
+    const suffix = res.mode === 'enforce'
+      ? (res.requiresRestart ? ' — restart GoClaw to apply.' : '.')
+      : ` — "${res.mode}" mode: flagged only, channel limits are not enforced.`;
+    showToast(`${t('throttle_run_ok') || 'Throttle check completed.'} ${n} action${n === 1 ? '' : 's'}${suffix}`, 'success');
   } catch (err) { showToast(err.message, 'error'); }
 };
 

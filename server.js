@@ -23,7 +23,7 @@ const http     = require('http');
 const { URL }  = require('url');
 
 const { testConnections } = require('./src/db');
-const { runThrottleCheck } = require('./src/services/throttle');
+const { runThrottleCheck, syncCompaniesFromAitm, ensureTrialAssignments, THROTTLE_MODE, GOCLAW_CONFIG } = require('./src/services/throttle');
 const { syncGoclawTraces, computeDailyAggregates } = require('./src/services/usage-sync');
 
 const adminUsageRoutes  = require('./src/routes/admin-usage');
@@ -122,8 +122,15 @@ cron.schedule(`*/${CRON_SYNC} * * * *`, async () => {
 cron.schedule(`*/${CRON_THROTTLE} * * * *`, async () => {
   console.log(`[Cron] 🛡️  Running throttle check...`);
   try {
+    const sync = await syncCompaniesFromAitm();
+    if (sync.mappingsUpdated > 0) console.log('[Cron] Company sync:', sync);
+    const trials = await ensureTrialAssignments();
+    if (trials > 0) console.log(`[Cron] Trial plans auto-assigned: ${trials}`);
     const result = await runThrottleCheck();
-    if (result.actions?.length) console.log('[Cron] Throttle actions:', result.actions);
+    if (result.actions?.length) {
+      console.log(`[Cron] Throttle actions (${result.mode} mode):`, result.actions);
+      if (result.requiresRestart) console.log('[Cron] ⚠️  GoClaw container restart required to apply the quota config change');
+    }
   } catch (err) { console.error('[Cron] Throttle error:', err.message); }
 });
 
@@ -138,8 +145,15 @@ cron.schedule('0 0 * * *', async () => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n🚀 LLM Usage Dashboard running at http://0.0.0.0:${PORT}`);
-  console.log(`   Throttle check: every ${CRON_THROTTLE} minutes`);
+  console.log(`   Throttle check: every ${CRON_THROTTLE} minutes (channel mode: ${THROTTLE_MODE})`);
   console.log(`   GoClaw sync:    every ${CRON_SYNC} minutes`);
-  console.log(`   GoClaw API:     ${GOCLAW_API}\n`);
+  console.log(`   GoClaw API:     ${GOCLAW_API}`);
+  if (THROTTLE_MODE === 'enforce') {
+    console.log(`   Channel quota:  ${GOCLAW_CONFIG}\n`);
+  } else {
+    console.log(`   ⚠️  Channel (WhatsApp) quotas are NOT enforced in "${THROTTLE_MODE}" mode —`);
+    console.log(`      members reaching agents outside the talent app are only audit-flagged.`);
+    console.log(`      Web chat is enforced per request by the AITM backend preflight.\n`);
+  }
   await testConnections();
 });

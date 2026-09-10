@@ -10,6 +10,7 @@ const BASE_PATH    = window.location.pathname.startsWith('/quota') ? '/quota' : 
 const API_BASE     = window.location.origin + BASE_PATH;
 const AITM_AUTH_URL = `${window.location.origin}/auth/login`; // AITM backend is always at domain root
 const DIRECT_AUTH   = `${window.location.origin}/auth/login`;
+const LIVE_REFRESH_MS = 15000;
 
 /* ─── State ──────────────────────────────────────────────────────────────────── */
 const state = {
@@ -20,6 +21,16 @@ const state = {
 };
 
 /* ─── Utility Functions ──────────────────────────────────────────────────────── */
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function fmtTokens(n) {
   if (n === null || n === undefined) return '—';
   const num = Number(n);
@@ -179,8 +190,10 @@ async function handleLogin(email, password) {
 
   // Decode payload
   const payload = JSON.parse(atob(token.split('.')[1]));
-  if (!['ADMIN', 'HUMAN RESOURCES', 'HIRING MANAGER'].includes(payload.role)) {
-    throw new Error('Access denied. This dashboard is for Admin, HR, and Hiring Managers only.');
+  // Sysadmin-only surface: HR admins and users monitor plans and usage in the
+  // talent app web UI instead.
+  if (payload.role !== 'ADMIN') {
+    throw new Error('Access denied. This dashboard is for sysadmins only — plan and usage monitoring for HR lives in the talent app.');
   }
 
   state.token = token;
@@ -206,6 +219,9 @@ function restoreSession() {
   try {
     const payload = JSON.parse(atob(token.split('.')[1]));
     if (payload.exp * 1000 < Date.now()) { localStorage.clear(); return false; }
+    // A stored session from before the dashboard became sysadmin-only must not
+    // bypass the login gate.
+    if (payload.role !== 'ADMIN') { localStorage.clear(); return false; }
     state.token = token;
     state.user  = JSON.parse(user);
     return true;
@@ -218,15 +234,12 @@ function showApp() {
   document.getElementById('app').style.display = 'flex';
   renderSidebar();
   renderUserCard();
-  // ADMIN → admin overview, HR/HM → personal usage page
-  const defaultPage = state.user?.role === 'ADMIN' ? 'overview' : 'my-usage';
-  router.navigate(defaultPage);
+  router.navigate('overview');
 }
 
 function renderSidebar() {
-  const isAdmin = state.user?.role === 'ADMIN';
   const nav = document.getElementById('sidebar-nav');
-  const adminItems = isAdmin ? `
+  nav.innerHTML = `
     <div class="sidebar-section">${t('section_admin')}</div>
     <button class="nav-item" data-page="overview">
       <span class="nav-icon">📊</span>${t('nav_overview')}
@@ -248,20 +261,6 @@ function renderSidebar() {
     </button>
     <button class="nav-item" data-page="settings">
       <span class="nav-icon">🔧</span>${t('nav_settings')}
-    </button>
-  ` : '';
-
-  nav.innerHTML = `
-    ${adminItems}
-    <div class="sidebar-section">${t('section_me')}</div>
-    <button class="nav-item" data-page="my-usage">
-      <span class="nav-icon">📈</span>${t('nav_my_usage')}
-    </button>
-    <button class="nav-item" data-page="my-events">
-      <span class="nav-icon">🕐</span>${t('nav_my_events')}
-    </button>
-    <button class="nav-item" data-page="my-plan">
-      <span class="nav-icon">📦</span>${t('nav_my_plan')}
     </button>
   `;
 
@@ -299,9 +298,6 @@ window.router = {
       'plans':     pages.plans,
       'mappings':  pages.mappings,
       'settings':  pages.settings,
-      'my-usage':  pages.myUsage,
-      'my-events': pages.myEvents,
-      'my-plan':   pages.myPlan,
     };
     const fn = map[page] || map['overview'];
     const titles = {
@@ -312,14 +308,27 @@ window.router = {
       plans:    [t('page_plans'),    t('page_plans_sub')],
       mappings: [t('page_mappings'), t('page_mappings_sub')],
       settings: [t('page_settings'), t('page_settings_sub')],
-      'my-usage':  [t('page_my_usage'),  t('page_my_usage_sub')],
-      'my-events': [t('nav_my_events'),  ''],
-      'my-plan':   [t('nav_my_plan'),    ''],
     };
     const [title, sub] = titles[page] || ['', ''];
     document.getElementById('page-title').textContent = title;
     document.getElementById('page-sub').textContent = sub;
     fn();
+    this.startLiveRefresh(fn);
+  },
+  // Monitoring pages expose a `refresh` hook that re-fetches their data without
+  // rebuilding the DOM, so filters and scroll position survive a live tick.
+  startLiveRefresh(fn) {
+    if (this.liveTimer) { clearInterval(this.liveTimer); this.liveTimer = null; }
+    const indicator = document.getElementById('live-indicator');
+    if (typeof fn.refresh !== 'function') {
+      if (indicator) indicator.hidden = true;
+      return;
+    }
+    if (indicator) indicator.hidden = false;
+    this.liveTimer = setInterval(() => {
+      if (document.getElementById('modal-overlay')?.classList.contains('open')) return;
+      fn.refresh();
+    }, LIVE_REFRESH_MS);
   },
 };
 
@@ -466,6 +475,8 @@ pages.overview = async function() {
     await loadOverviewData(e.target.value);
   });
 
+  pages.overview.refresh = () =>
+    loadOverviewData(document.getElementById('overview-period')?.value || 'this_month');
   await loadOverviewData('this_month');
 };
 
@@ -675,8 +686,7 @@ pages.users = async function() {
     quotaType = document.getElementById('user-quota-type').value;
     skip = 0; loadUsers();
   });
-  document.getElementById('user-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') { search = e.target.value; skip = 0; loadUsers(); } });
-
+  pages.users.refresh = loadUsers;
   loadUsers();
 };
 
@@ -796,6 +806,7 @@ pages.events = async function() {
     loadEvents();
   });
   document.getElementById('ev-period').addEventListener('change', (e) => { period = e.target.value; filters.skip = 0; loadEvents(); });
+  pages.events.refresh = loadEvents;
   loadEvents();
 };
 
@@ -807,21 +818,29 @@ pages.workflows = async function() {
     <th>Total Tokens</th><th>Total Cost</th><th>Success</th><th>Failed</th><th>Rejected</th><th>Avg Tokens/Req</th></tr></thead>
     <tbody id="wf-tbody"><tr><td colspan="9" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
   </table></div>`;
-  try {
-    const data = await GET('/api/admin/workflows');
-    if (!data) return;
-    document.getElementById('wf-tbody').innerHTML = data.items?.length ? data.items.map(w => `<tr>
-      <td>${sourceBadge(w.source_service)}</td>
-      <td class="text-sm">${w.feature_name || '—'}</td>
-      <td class="text-sm monospace">${w.workflow_name || '—'}</td>
-      <td class="font-semibold">${fmtTokens(w.totalTokens)}</td>
-      <td class="text-sm">${fmtCost(w.totalCost)}</td>
-      <td class="text-success">${w.success_count}</td>
-      <td class="text-danger">${w.failed_count}</td>
-      <td class="text-warning">${w.rejected_count}</td>
-      <td class="text-xs">${fmtTokens(w.avgTokensPerRequest)}</td>
-    </tr>`).join('') : `<tr><td colspan="9" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
-  } catch { showToast(t('error_load'), 'error'); }
+
+  async function loadWorkflows() {
+    try {
+      const data = await GET('/api/admin/workflows');
+      if (!data) return;
+      const tbody = document.getElementById('wf-tbody');
+      if (!tbody) return;
+      tbody.innerHTML = data.items?.length ? data.items.map(w => `<tr>
+        <td>${sourceBadge(w.source_service)}</td>
+        <td class="text-sm">${w.feature_name || '—'}</td>
+        <td class="text-sm monospace">${w.workflow_name || '—'}</td>
+        <td class="font-semibold">${fmtTokens(w.totalTokens)}</td>
+        <td class="text-sm">${fmtCost(w.totalCost)}</td>
+        <td class="text-success">${w.success_count}</td>
+        <td class="text-danger">${w.failed_count}</td>
+        <td class="text-warning">${w.rejected_count}</td>
+        <td class="text-xs">${fmtTokens(w.avgTokensPerRequest)}</td>
+      </tr>`).join('') : `<tr><td colspan="9" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
+    } catch { showToast(t('error_load'), 'error'); }
+  }
+
+  pages.workflows.refresh = loadWorkflows;
+  await loadWorkflows();
 };
 
 /* ── Plans & Assignments ─────────────────────────────────────────────────────── */
@@ -844,6 +863,14 @@ pages.plans = async function() {
       renderPlansTab(btn.dataset.tab);
     });
   });
+
+  pages.plans.refresh = () => {
+    const activeTab = document.querySelector('.inner-tab.active')?.dataset.tab || 'plans';
+    if (activeTab === 'plans') loadPlans();
+    else if (activeTab === 'assignments') loadAssignments();
+    else if (activeTab === 'bundles') loadBundles();
+    else if (activeTab === 'companies') loadAitmCompanies();
+  };
 
   renderPlansTab('plans');
 };
@@ -888,14 +915,22 @@ async function renderPlansTab(tab) {
     area.innerHTML = `
       <div class="section-header">
         <div class="section-title">One-time Bundles (Messages / Tokens)</div>
-        <button class="btn btn-primary btn-sm" id="btn-add-bundle">+ ${t('btn_add_bundle')}</button>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-ghost btn-sm" id="btn-refresh-bundles">↻ Refresh</button>
+          <button class="btn btn-primary btn-sm" id="btn-add-bundle">+ ${t('btn_add_bundle') || 'Add Bundle'}</button>
+        </div>
       </div>
       <p class="text-muted text-sm" style="margin-bottom:16px;">Paid top-ups that stack on the current period without resetting it. Enter messages for current plans, tokens for legacy token-enforced ones. To hand back the full allowance instead — a repeat demo or renewal — use Reset Period on the Companies tab.</p>
-      <div class="card">
-        <p class="text-muted text-sm">Select a user to view their bundles.</p>
-      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Target</th><th>Type</th><th>Messages</th><th>Tokens Remaining</th><th>Expires At</th><th>Note</th><th>Status</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="bundles-tbody"><tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
+      </table></div>
     `;
     document.getElementById('btn-add-bundle').addEventListener('click', () => pages.plans.showBundleModal());
+    document.getElementById('btn-refresh-bundles').addEventListener('click', () => loadBundles());
+    loadBundles();
   } else if (tab === 'companies') {
     area.innerHTML = `
       <div class="section-header">
@@ -1061,6 +1096,78 @@ async function loadAssignments() {
     <td>${fmtDate(u.resetAt)}</td>
     <td>${statusBadge(u.status)}</td>
   </tr>`).join('') : `<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--text-muted);">No assignments yet.</td></tr>`;
+}
+
+async function loadBundles() {
+  const tbody = document.getElementById('bundles-tbody');
+  if (!tbody) return;
+  try {
+    const data = await GET('/api/admin/bundles').catch(() => null);
+    if (!data) {
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-danger);">Failed to load bundles.</td></tr>`;
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">No bundles issued yet.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = items.map(b => {
+      const isRevoked = b.status === 'REVOKED';
+      const isExpired = b.status === 'EXPIRED';
+      const isExhausted = b.status === 'EXHAUSTED';
+      let badgeClass = 'badge-healthy';
+      if (isRevoked) badgeClass = 'badge-rejected';
+      else if (isExpired) badgeClass = 'badge-warning';
+      else if (isExhausted) badgeClass = 'badge-exhausted';
+
+      const canRevoke = !isRevoked && !isExpired && !isExhausted;
+      const targetLabel = escapeHtml(b.targetName);
+      const subLabel = b.targetType === 'Company' ? 'Shared Company Quota' : escapeHtml(b.userEmail || '');
+      const noteLabel = b.note ? escapeHtml(b.note) : '—';
+
+      return `<tr>
+        <td>
+          <div style="font-weight:600; font-size:13px;">${targetLabel}</div>
+          <div class="text-xs text-muted">${subLabel}</div>
+        </td>
+        <td><span class="badge ${b.targetType === 'Company' ? 'badge-backend' : 'badge-healthy'}">${b.targetType}</span></td>
+        <td>${b.quotaMessages !== null && b.quotaMessages !== undefined ? `<strong>${b.quotaMessages}</strong> msgs` : '<span class="text-muted">—</span>'}</td>
+        <td>${fmtTokens(b.remainingTokens)} / ${fmtTokens(b.quotaTokens)}</td>
+        <td>${b.expiresAt ? fmtDate(b.expiresAt) : '<span class="text-muted">Never</span>'}</td>
+        <td style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${noteLabel}">${noteLabel}</td>
+        <td><span class="badge ${badgeClass}">${b.status}</span></td>
+        <td>
+          ${canRevoke ? `<button class="btn btn-ghost btn-xs text-danger btn-revoke-bundle" data-id="${b.id}">Revoke</button>` : '<span class="text-muted">—</span>'}
+        </td>
+      </tr>`;
+    }).join('');
+
+    tbody.querySelectorAll('.btn-revoke-bundle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-id');
+        modal.open('Revoke Bundle', `
+          <p style="margin-bottom:12px;">Are you sure you want to revoke this quota bundle? The remaining allowance will be immediately cleared to 0.</p>
+        `, `
+          <button class="btn btn-ghost" onclick="modal.close()">${t('cancel') || 'Cancel'}</button>
+          <button class="btn btn-danger" id="btn-confirm-revoke">Revoke</button>
+        `);
+        document.getElementById('btn-confirm-revoke').addEventListener('click', async () => {
+          try {
+            await DEL('/api/admin/bundles/' + id);
+            modal.close();
+            showToast('Bundle revoked successfully', 'success');
+            loadBundles();
+          } catch (err) {
+            showToast('Revoke failed: ' + err.message, 'error');
+          }
+        });
+      });
+    });
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-danger);">Failed to load bundles: ${err.message}</td></tr>`;
+  }
 }
 
 async function showCreatePlanModal() {
@@ -1462,6 +1569,7 @@ pages.mappings = async function() {
       </table></div>
     </div>
   `;
+  pages.mappings.refresh = loadMappings;
   await loadMappings();
 };
 
@@ -1937,169 +2045,6 @@ window.runThrottleCheck = async function() {
       : ` — "${res.mode}" mode: flagged only, channel limits are not enforced.`;
     showToast(`${t('throttle_run_ok') || 'Throttle check completed.'} ${n} action${n === 1 ? '' : 's'}${suffix}`, 'success');
   } catch (err) { showToast(err.message, 'error'); }
-};
-
-/* ── My Usage ────────────────────────────────────────────────────────────────── */
-pages.myUsage = async function() {
-  const content = document.getElementById('page-content');
-  content.innerHTML = `<div id="my-usage-content"><div class="skeleton skeleton-card"></div></div>`;
-  try {
-    const data = await GET('/api/me/summary');
-    if (!data) return;
-    const q = data.quota;
-    const bannerType = q.quotaStatus === 'CRITICAL' ? 'critical' : q.quotaStatus === 'WARNING' ? 'warning' : q.quotaStatus === 'EXHAUSTED' ? 'exhausted' : null;
-    const bannerMsg  = q.quotaStatus === 'CRITICAL'  ? t('quota_critical',  { pct: 100 - q.usagePercentage })
-                     : q.quotaStatus === 'WARNING'   ? t('quota_warning',   { pct: 100 - q.usagePercentage })
-                     : q.quotaStatus === 'EXHAUSTED' ? t('quota_exhausted')
-                     : q.quotaStatus === 'NO_PLAN'   ? t('no_plan')
-                     : null;
-
-    document.getElementById('my-usage-content').innerHTML = `
-      ${bannerMsg ? `<div class="quota-banner ${bannerType}">${bannerMsg}</div>` : ''}
-
-      <div class="stats-grid">
-        <div class="stat-card">
-          <span class="stat-icon">📦</span>
-          <div class="stat-value">${data.plan?.name || '—'}</div>
-          <div class="stat-label">${t('my_plan')}</div>
-        </div>
-        <div class="stat-card">
-          <span class="stat-icon">🧮</span>
-          <div class="stat-value">${fmtTokens(data.usageThisPeriod.totalTokens)}</div>
-          <div class="stat-label">${t('my_used')}</div>
-        </div>
-        <div class="stat-card">
-          <span class="stat-icon">✅</span>
-          <div class="stat-value">${fmtTokens(q.totalRemainingTokens)}</div>
-          <div class="stat-label">${t('my_remaining')}</div>
-        </div>
-        <div class="stat-card">
-          <span class="stat-icon">🔄</span>
-          <div class="stat-value">${fmtDate(data.plan?.resetAt)}</div>
-          <div class="stat-label">${t('my_reset')}</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header"><div class="card-title">${t('my_quota')}</div><div>${statusBadge(q.quotaStatus)}</div></div>
-        <div class="quota-display">
-          <div class="quota-row"><span class="quota-label">${t('my_recurring')}</span><span class="quota-value">${fmtTokens(q.remainingRecurringTokens)} / ${fmtTokens(q.planQuota)}</span></div>
-          <div class="progress-wrap" style="margin:8px 0;"><div class="progress-bar ${progressBarClass(q.usagePercentage)}" style="width:${q.usagePercentage}%"></div></div>
-          <div class="quota-row"><span class="quota-label">${t('my_bundle')}</span><span class="quota-value" style="color:var(--success)">${fmtTokens(q.remainingBundleTokens)}</span></div>
-        </div>
-        ${data.bundles?.length ? `
-          <div style="margin-top:12px;">
-            <div class="text-sm font-semibold" style="margin-bottom:8px;">Active Bundles</div>
-            ${data.bundles.map(b => `<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border-subtle); font-size:12px;">
-              <span>${b.expiresAt ? 'Expires ' + fmtDate(b.expiresAt) : 'No expiry'} ${b.note ? '• ' + b.note : ''}</span>
-              <span class="font-semibold">${fmtTokens(b.remainingTokens)} / ${fmtTokens(b.quotaTokens)}</span>
-            </div>`).join('')}
-          </div>
-        ` : ''}
-      </div>
-    `;
-  } catch (err) { showToast(t('error_load'), 'error'); }
-};
-
-/* ── My Events ───────────────────────────────────────────────────────────────── */
-pages.myEvents = async function() {
-  const content = document.getElementById('page-content');
-  let period = 'this_month', skip = 0, take = 20;
-  content.innerHTML = `
-    <div class="filters-bar">
-      ${periodSelectorHTML('mev-period', period)}
-      <select id="mev-status" class="form-control" style="width:auto; padding:6px 28px 6px 10px; font-size:12px;">
-        <option value="">${t('filter_all_statuses')}</option>
-        <option value="SUCCESS">SUCCESS</option>
-        <option value="FAILED">FAILED</option>
-        <option value="REJECTED">REJECTED</option>
-      </select>
-      <button class="btn btn-ghost btn-sm" id="mev-filter-btn">Filter</button>
-    </div>
-    <div class="table-wrap"><table>
-      <thead><tr>
-        <th>${t('col_time')}</th><th>${t('col_source')}</th><th>${t('col_feature')}</th>
-        <th>${t('col_model')}</th><th>${t('col_total')}</th>
-        <th>${t('col_cost')}</th><th>${t('col_latency')}</th><th>${t('col_status')}</th>
-      </tr></thead>
-      <tbody id="mev-tbody"><tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('loading')}</td></tr></tbody>
-    </table>
-    <div class="pagination" id="mev-pagination"></div></div>
-  `;
-
-  async function loadMyEvents() {
-    const { from, to } = getPeriod(period);
-    const params = new URLSearchParams({ from, to, skip, take });
-    const statusVal = document.getElementById('mev-status')?.value;
-    if (statusVal) params.set('status', statusVal);
-    const data = await GET(`/api/me/events?${params}`).catch(() => null);
-    if (!data) return;
-    const tbody = document.getElementById('mev-tbody');
-    tbody.innerHTML = data.items?.length ? data.items.map(e => `<tr>
-      <td class="text-xs monospace">${fmtDateTime(e.created_at)}</td>
-      <td>${sourceBadge(e.source_service)}</td>
-      <td class="text-xs">${e.feature_name || '—'}</td>
-      <td class="text-xs monospace">${e.model_name || '—'}</td>
-      <td class="font-semibold">${fmtTokens(e.totalTokens)}</td>
-      <td class="text-xs">${fmtCost(e.costAmount)}</td>
-      <td class="text-xs">${fmtLatency(e.latency_ms)}</td>
-      <td>${statusBadge(e.status)}</td>
-    </tr>`).join('') : `<tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted);">${t('no_results')}</td></tr>`;
-    const totalPages = Math.ceil(data.total / take);
-    const currentPage = Math.floor(skip / take) + 1;
-    document.getElementById('mev-pagination').innerHTML = `
-      <span>${t('showing', { from: skip+1, to: Math.min(skip+take, data.total), total: data.total })}</span>
-      <div class="pagination-controls">
-        <button class="btn btn-xs btn-ghost" onclick="mevGoPage(${currentPage-1})" ${currentPage<=1?'disabled':''}>←</button>
-        <span style="padding:4px 8px; font-size:12px;">${currentPage} / ${totalPages}</span>
-        <button class="btn btn-xs btn-ghost" onclick="mevGoPage(${currentPage+1})" ${currentPage>=totalPages?'disabled':''}>→</button>
-      </div>
-    `;
-  }
-  window.mevGoPage = (p) => { skip = (p-1)*take; loadMyEvents(); };
-  document.getElementById('mev-filter-btn').addEventListener('click', () => { skip = 0; loadMyEvents(); });
-  document.getElementById('mev-period').addEventListener('change', (e) => { period = e.target.value; skip = 0; loadMyEvents(); });
-  loadMyEvents();
-};
-
-/* ── My Plan ─────────────────────────────────────────────────────────────────── */
-pages.myPlan = async function() {
-  const content = document.getElementById('page-content');
-  content.innerHTML = `<div id="my-plan-content"><div class="skeleton skeleton-card"></div></div>`;
-  try {
-    const [plan, bundles] = await Promise.all([
-      GET('/api/me/plan').catch(() => null),
-      GET('/api/me/bundles'),
-    ]);
-    const planHTML = plan ? `
-      <div class="card" style="margin-bottom:16px;">
-        <div class="card-header"><div class="card-title">Recurring Plan</div><span class="badge badge-active">Active</span></div>
-        <div class="quota-display">
-          <div class="quota-row"><span class="quota-label">Plan Name</span><span class="quota-value">${plan.name}</span></div>
-          <div class="quota-row"><span class="quota-label">Quota Type</span><span class="quota-value">${t(plan.quota_type?.toLowerCase())}</span></div>
-          <div class="quota-row"><span class="quota-label">Quota</span><span class="quota-value">${fmtTokens(plan.quotaTokens)}</span></div>
-          <div class="quota-row"><span class="quota-label">Period</span><span class="quota-value">${fmtDate(plan.starts_at)} → ${fmtDate(plan.reset_at)}</span></div>
-        </div>
-      </div>
-    ` : `<div class="card" style="margin-bottom:16px;"><div class="empty-state"><div class="empty-state-icon">📦</div><h3>No Active Plan</h3><p>${t('no_plan')}</p></div></div>`;
-
-    const bundlesHTML = bundles?.items?.length ? bundles.items.map(b => `
-      <div class="quota-display">
-        <div class="quota-row">
-          <span class="quota-label">${b.note || 'Token Bundle'}</span>
-          <span class="badge badge-${b.bundle_status.toLowerCase()}">${t('bundle_' + b.bundle_status.toLowerCase())}</span>
-        </div>
-        <div class="quota-row"><span class="quota-label">Remaining</span><span class="quota-value">${fmtTokens(b.remainingTokens)} / ${fmtTokens(b.quotaTokens)}</span></div>
-        ${b.expires_at ? `<div class="quota-row"><span class="quota-label">Expires</span><span class="quota-value">${fmtDate(b.expires_at)}</span></div>` : ''}
-        <div class="progress-wrap"><div class="progress-bar accent" style="width:${Math.round((b.remainingTokens / b.quotaTokens) * 100)}%"></div></div>
-      </div>
-    `).join('') : `<p class="text-muted text-sm">No bundles.</p>`;
-
-    document.getElementById('my-plan-content').innerHTML = `
-      ${planHTML}
-      <div class="card"><div class="card-header"><div class="card-title">Token Bundles</div></div>${bundlesHTML}</div>
-    `;
-  } catch (err) { showToast(t('error_load'), 'error'); }
 };
 
 /* ── User Management Modals ──────────────────────────────────────────────────── */

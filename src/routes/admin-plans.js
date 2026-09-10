@@ -395,6 +395,62 @@ router.post('/bundles', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+router.get('/bundles', async (req, res) => {
+  try {
+    const { rows } = await dashboardPool.query(`
+      SELECT b.*, c.name AS company_name
+      FROM llm_quota_bundles b
+      LEFT JOIN llm_companies c ON c.id = b.company_id
+      ORDER BY b.created_at DESC
+    `);
+
+    const userIds = [...new Set(rows.map(r => r.user_id).filter(Boolean))];
+    let userMap = {};
+    if (userIds.length > 0) {
+      const { rows: uRows } = await aitmPool.query(`
+        SELECT id, name, email FROM users WHERE id = ANY($1::uuid[])
+      `, [userIds]);
+      for (const u of uRows) {
+        userMap[u.id] = u;
+      }
+    }
+
+    const items = rows.map(r => {
+      const u = r.user_id ? userMap[r.user_id] : null;
+      const isExpired = r.expires_at && new Date(r.expires_at) <= new Date();
+      let status = 'ACTIVE';
+      if (r.note && r.note.includes('[REVOKED]')) {
+        status = 'REVOKED';
+      } else if (isExpired) {
+        status = 'EXPIRED';
+      } else if (Number(r.remaining_tokens) <= 0 && (r.quota_messages === null || Number(r.quota_messages) <= 0)) {
+        status = 'EXHAUSTED';
+      }
+
+      return {
+        id: r.id,
+        userId: r.user_id,
+        userName: u ? u.name : null,
+        userEmail: u ? u.email : null,
+        companyId: r.company_id,
+        companyName: r.company_name,
+        targetType: r.company_id ? 'Company' : 'User',
+        targetName: r.company_id ? (r.company_name || 'Company') : (u ? u.name : (r.user_id ? 'Unknown User' : '—')),
+        quotaTokens: Number(r.quota_tokens || 0),
+        remainingTokens: Number(r.remaining_tokens || 0),
+        quotaMessages: r.quota_messages !== null ? Number(r.quota_messages) : null,
+        expiresAt: r.expires_at,
+        note: r.note,
+        status,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at
+      };
+    });
+
+    res.json({ items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.get('/bundles/:userId', async (req, res) => {
   try {
     // Company-scoped bundles are included because quota.js charges a member's
@@ -416,6 +472,39 @@ router.get('/bundles/:userId', async (req, res) => {
     })) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+router.delete('/bundles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await dashboardPool.query(
+      `SELECT * FROM llm_quota_bundles WHERE id = $1`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Bundle not found' });
+
+    const bundle = rows[0];
+    const revokedNote = bundle.note ? `[REVOKED] ${bundle.note}` : '[REVOKED]';
+
+    const { rows: updatedRows } = await dashboardPool.query(`
+      UPDATE llm_quota_bundles
+      SET remaining_tokens = 0,
+          quota_messages = 0,
+          expires_at = LEAST(COALESCE(expires_at, NOW()), NOW()),
+          note = $1,
+          updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+    `, [revokedNote, id]);
+
+    await dashboardPool.query(`
+      INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'bundle.revoke', 'llm_quota_bundle', $2, $3, NOW())
+    `, [req.user.id, id, JSON.stringify({ previous: bundle, updated: updatedRows[0] })]);
+
+    res.json({ success: true, message: 'Bundle revoked successfully', bundle: updatedRows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 // ─── Audit Log ────────────────────────────────────────────────────────────────
 router.get('/audit', async (req, res) => {

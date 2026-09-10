@@ -163,7 +163,8 @@ async function getUserQuotaSummary(userId) {
       p.name AS plan_name,
       p.quota_type,
       p.quota_tokens,
-      p.quota_messages
+      p.quota_messages,
+      p.max_members
     FROM llm_plan_assignments a
     JOIN llm_token_plans p ON p.id = a.plan_id
     WHERE a.user_id = $1 AND a.is_active = true
@@ -182,7 +183,8 @@ async function getUserQuotaSummary(userId) {
         p.name AS plan_name,
         p.quota_type,
         p.quota_tokens,
-        p.quota_messages
+        p.quota_messages,
+        p.max_members
       FROM llm_plan_assignments a
       JOIN llm_token_plans p ON p.id = a.plan_id
       WHERE a.company_id = $1 AND a.is_active = true

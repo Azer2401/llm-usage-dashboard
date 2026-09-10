@@ -22,7 +22,7 @@ const cron     = require('node-cron');
 const http     = require('http');
 const { URL }  = require('url');
 
-const { testConnections } = require('./src/db');
+const { testConnections, dashboardPool } = require('./src/db');
 const { runThrottleCheck, syncCompaniesFromAitm, ensureTrialAssignments, THROTTLE_MODE, GOCLAW_CONFIG } = require('./src/services/throttle');
 const { syncGoclawTraces, computeDailyAggregates } = require('./src/services/usage-sync');
 
@@ -33,7 +33,7 @@ const internalRoutes    = require('./src/routes/internal');
 
 const PORT          = parseInt(process.env.PORT || '3003', 10);
 const CRON_THROTTLE = parseInt(process.env.CRON_THROTTLE_MINUTES || '5', 10);
-const CRON_SYNC     = parseInt(process.env.CRON_GOCLAW_SYNC_MINUTES || '5', 10);
+const CRON_SYNC_SECONDS = parseInt(process.env.CRON_GOCLAW_SYNC_SECONDS || '30', 10);
 const GOCLAW_API    = process.env.GOCLAW_API_URL   || 'http://localhost:18790';
 const GOCLAW_TOKEN  = process.env.GOCLAW_GATEWAY_TOKEN || '';
 
@@ -63,7 +63,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ─── API Routes ───────────────────────────────────────────────────────────────
 app.use('/api/admin',    adminUsageRoutes);
 app.use('/api/admin',    adminPlansRoutes);
-app.use('/api/me',       userUsageRoutes);
+// app.use('/api/me',       userUsageRoutes); // Deprecated: dead routes superseded by AITM backend /api/me/quota and dashboard /api/admin
 app.use('/api/internal', internalRoutes);
 
 // ─── GoClaw API Proxy ─────────────────────────────────────────────────────────
@@ -106,14 +106,36 @@ app.get('/api/goclaw/usage/breakdown',     requireAuth, requireAdmin, (req, res)
 app.get('/api/goclaw/usage-caps/policies', requireAuth, requireAdmin, (req, res) => proxyToGoclaw(req, res, '/v1/usage-caps/policies'));
 app.get('/api/goclaw/contacts',            requireAuth, requireAdmin, (req, res) => proxyToGoclaw(req, res, '/v1/contacts'));
 
+// ─── Health Check ─────────────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
+  try {
+    const dbCheck = await dashboardPool.query('SELECT 1');
+    res.json({
+      status: 'ok',
+      service: 'llm-usage-dashboard',
+      timestamp: new Date().toISOString(),
+      database: dbCheck.rows.length ? 'connected' : 'unhealthy'
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'unhealthy',
+      service: 'llm-usage-dashboard',
+      timestamp: new Date().toISOString(),
+      error: err.message
+    });
+  }
+});
+
 // ─── SPA fallback ─────────────────────────────────────────────────────────────
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // ─── Cron Jobs ────────────────────────────────────────────────────────────────
-// GoClaw traces sync (every N minutes)
-cron.schedule(`*/${CRON_SYNC} * * * *`, async () => {
+// GoClaw traces sync (every N seconds — six-field cron). Message quotas are
+// counted from these traces, so the old minute-granular run made quota
+// counters lag by minutes; the UI live-refreshes every 15s.
+cron.schedule(`*/${CRON_SYNC_SECONDS} * * * * *`, async () => {
   console.log(`[Cron] 🔄 Syncing GoClaw traces...`);
   try { await syncGoclawTraces(); } catch (err) { console.error('[Cron] Sync error:', err.message); }
 });
@@ -146,7 +168,7 @@ cron.schedule('0 0 * * *', async () => {
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n🚀 LLM Usage Dashboard running at http://0.0.0.0:${PORT}`);
   console.log(`   Throttle check: every ${CRON_THROTTLE} minutes (channel mode: ${THROTTLE_MODE})`);
-  console.log(`   GoClaw sync:    every ${CRON_SYNC} minutes`);
+  console.log(`   GoClaw sync:    every ${CRON_SYNC_SECONDS} seconds`);
   console.log(`   GoClaw API:     ${GOCLAW_API}`);
   if (THROTTLE_MODE === 'enforce') {
     console.log(`   Channel quota:  ${GOCLAW_CONFIG}\n`);
@@ -155,5 +177,7 @@ app.listen(PORT, '0.0.0.0', async () => {
     console.log(`      members reaching agents outside the talent app are only audit-flagged.`);
     console.log(`      Web chat is enforced per request by the AITM backend preflight.\n`);
   }
+  // Fresh counters immediately after a restart instead of waiting a full tick.
+  try { await syncGoclawTraces(); } catch (err) { console.error('[Cron] Initial sync error:', err.message); }
   await testConnections();
 });

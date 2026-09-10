@@ -212,6 +212,7 @@ body {
 }
 
 .topbar-title { font-size: 17px; font-weight: 700; }
+.live-dot { margin-left: 8px; font-size: 11px; font-weight: 600; color: var(--success, #10b981); vertical-align: middle; }
 .topbar-sub   { font-size: 12px; color: var(--text-secondary); }
 
 .topbar-actions { display: flex; align-items: center; gap: 10px; }

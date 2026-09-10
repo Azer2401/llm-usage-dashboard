@@ -79,6 +79,7 @@ router.post('/preflight', async (req, res) => {
       planMessages:             result.planMessages ?? null,
       totalRemainingMessages:   result.totalRemainingMessages ?? null,
       periodEnd:                result.periodEnd || null,
+      planName:                 result.assignment ? result.assignment.plan_name : null,
       windows:                  result.windows || null,
     });
   } catch (err) {
@@ -263,6 +264,10 @@ router.post('/quota-summary', async (req, res) => {
         quotaType:     summary.assignment.quota_type,
         quotaMessages: summary.assignment.quota_messages !== null && summary.assignment.quota_messages !== undefined ? Number(summary.assignment.quota_messages) : null,
         quotaTokens:   Number(summary.assignment.quota_tokens),
+        maxMembers:    summary.assignment.max_members !== null && summary.assignment.max_members !== undefined ? Number(summary.assignment.max_members) : null,
+        overMemberCap: summary.assignment.max_members !== null && summary.assignment.max_members !== undefined
+          ? memberCount > Number(summary.assignment.max_members)
+          : false,
         startsAt:      summary.assignment.starts_at,
         resetAt:       summary.assignment.reset_at,
       } : null,
@@ -294,6 +299,92 @@ router.post('/quota-summary', async (req, res) => {
     });
   } catch (err) {
     console.error('[Internal] POST /quota-summary error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/internal/company-cap ─────────────────────────────────────────
+// Headcount against the active plan's member cap, so the AITM backend can
+// enforce the cap when an HR admin adds a member. The cap is otherwise only
+// checked on plan assignment / member mapping.
+router.post('/company-cap', async (req, res) => {
+  try {
+    const { companyId } = req.body;
+    if (!companyId) return res.status(400).json({ error: 'companyId required' });
+
+    const [mRes, pRes] = await Promise.all([
+      aitmPool.query(`SELECT COUNT(*)::int AS member_count FROM employees WHERE company_id = $1`, [companyId]),
+      dashboardPool.query(`
+        SELECT p.max_members
+        FROM llm_plan_assignments a
+        JOIN llm_token_plans p ON p.id = a.plan_id
+        WHERE a.company_id = $1 AND a.is_active = true
+        LIMIT 1
+      `, [companyId]),
+    ]);
+    const raw = pRes.rows[0] ? pRes.rows[0].max_members : null;
+    const maxMembers = raw !== null && raw !== undefined ? Number(raw) : null;
+    const memberCount = mRes.rows[0].member_count;
+    res.json({
+      companyId,
+      memberCount,
+      maxMembers,
+      overMemberCap: maxMembers !== null && memberCount > maxMembers,
+    });
+  } catch (err) {
+    console.error('[Internal] POST /company-cap error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/internal/member-unlink ───────────────────────────────────────
+// Called by the AITM backend when an HR admin removes a member from the
+// company: drop the mapping (which otherwise lingers as a ghost row, since it
+// lives in this database with no FK to AITM users), end any individual
+// assignment, and hand the now-standalone account its own Demo Trial plan so
+// it keeps limited access instead of silently drawing on the company plan.
+router.post('/member-unlink', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    await dashboardPool.query(`DELETE FROM llm_user_mappings WHERE user_id = $1`, [userId]);
+    await dashboardPool.query(`
+      UPDATE llm_plan_assignments
+      SET is_active = false, ended_at = NOW(), updated_at = NOW()
+      WHERE user_id = $1 AND is_active = true
+    `, [userId]);
+
+    const planRes = await dashboardPool.query(`
+      SELECT id, name, quota_type FROM llm_token_plans
+      WHERE LOWER(name) = 'demo trial' AND is_active = true LIMIT 1
+    `);
+    let demoPlanAssigned = false;
+    let planName = null;
+    if (planRes.rows.length > 0) {
+      const plan = planRes.rows[0];
+      const start = new Date();
+      const reset = new Date(start);
+      if (plan.quota_type === 'YEARLY') {
+        reset.setFullYear(reset.getFullYear() + 1); reset.setMonth(0); reset.setDate(1); reset.setHours(0, 0, 0, 0);
+      } else {
+        reset.setMonth(reset.getMonth() + 1); reset.setDate(1); reset.setHours(0, 0, 0, 0);
+      }
+      await dashboardPool.query(`
+        INSERT INTO llm_plan_assignments (id, user_id, plan_id, company_id, starts_at, reset_at, is_active, created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, true, NOW(), NOW())
+      `, [userId, plan.id, start, reset]);
+      demoPlanAssigned = true;
+      planName = plan.name;
+    }
+
+    await dashboardPool.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'member.unlink', 'aitm_user', $2, $3, NOW())`,
+      ['system', userId, JSON.stringify({ demoPlanAssigned, planName })]);
+
+    res.json({ unlinked: true, demoPlanAssigned, planName });
+  } catch (err) {
+    console.error('[Internal] POST /member-unlink error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

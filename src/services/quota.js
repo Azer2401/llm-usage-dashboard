@@ -28,7 +28,11 @@ function getPeriodWindow(assignment, now = new Date()) {
   };
 }
 
-const MESSAGE_EVENT_FILTER = `source_service = 'GOCLAW' AND feature_name = 'goclaw_chat'`;
+// Message counting includes PENDING markers: the AITM backend writes one per
+// accepted chat send so back-to-back sends are counted before the GoClaw trace
+// sync (30s cron) lands. usage-sync consumes markers FIFO per user once the
+// real trace arrives and purges stale ones, so nothing is double counted.
+const MESSAGE_COUNT_FILTER = `feature_name = 'goclaw_chat' AND (status = 'SUCCESS' OR status = 'PENDING')`;
 
 // ─── Rolling window limits (HR-admin configurable, counted per member) ───────
 const WINDOW_MS = {
@@ -77,8 +81,7 @@ async function getWindowMessageUsage(userId, windowMs) {
     SELECT COUNT(*) AS used, MIN(created_at) AS oldest
     FROM llm_usage_events
     WHERE user_id = $1
-      AND status = 'SUCCESS'
-      AND ${MESSAGE_EVENT_FILTER}
+      AND ${MESSAGE_COUNT_FILTER}
       AND created_at >= $2
   `, [userId, since]);
   return { used: Number(res.rows[0].used), oldest: res.rows[0].oldest || null };
@@ -172,7 +175,7 @@ async function getUserQuotaSummary(userId) {
   `, [userId]);
 
   if (planRes.rows.length === 0 && companyId) {
-    planRes = await dashboardPool.query(`
+    const compPlanRes = await dashboardPool.query(`
       SELECT
         a.id AS assignment_id,
         a.plan_id,
@@ -190,13 +193,54 @@ async function getUserQuotaSummary(userId) {
       WHERE a.company_id = $1 AND a.is_active = true
       LIMIT 1
     `, [companyId]);
+
+    const compPlan = compPlanRes.rows[0] || null;
+    if (compPlan) {
+      // If the company plan has a member cap, only allocated seat holders
+      // (in llm_user_mappings WHERE company_id = $companyId) inherit the shared company plan.
+      if (compPlan.max_members !== null && compPlan.max_members !== undefined) {
+        const isAllocated = mappingRes.rows[0]?.company_id === companyId;
+        if (isAllocated) {
+          planRes = compPlanRes;
+        } else {
+          // Non-allocated employee: falls back to default trial plan if one exists
+          const trialPlan = await dashboardPool.query(`
+            SELECT id AS plan_id, name AS plan_name, quota_type, quota_tokens, quota_messages, max_members
+            FROM llm_token_plans
+            WHERE name ILIKE '%Trial%' AND is_active = true
+            ORDER BY created_at ASC LIMIT 1
+          `);
+          if (trialPlan.rows.length > 0) {
+            planRes = {
+              rows: [{
+                assignment_id: null,
+                plan_id: trialPlan.rows[0].plan_id,
+                starts_at: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
+                reset_at: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1),
+                company_id: null,
+                user_id: userId,
+                plan_name: trialPlan.rows[0].plan_name + ' (Unassigned Seat)',
+                quota_type: trialPlan.rows[0].quota_type,
+                quota_tokens: trialPlan.rows[0].quota_tokens,
+                quota_messages: trialPlan.rows[0].quota_messages,
+                max_members: null,
+              }],
+            };
+          }
+        }
+      } else {
+        // Unlimited plan: all employees share the plan
+        planRes = compPlanRes;
+      }
+    }
   }
 
   const assignment = planRes.rows[0] || null;
 
   // 2. Get active bundle balances (both individual and company-level bundles)
   let bundleRes;
-  if (companyId) {
+  const isAllocatedCompanyMember = assignment?.company_id === companyId && companyId !== null;
+  if (isAllocatedCompanyMember) {
     bundleRes = await dashboardPool.query(`
       SELECT
         id, quota_tokens, remaining_tokens, quota_messages, expires_at, created_at, company_id, user_id
@@ -227,11 +271,10 @@ async function getUserQuotaSummary(userId) {
     const scopeCompany = !!assignment.company_id;
     const usageRes = await dashboardPool.query(`
       SELECT
-        COALESCE(SUM(total_tokens), 0) AS used_tokens,
-        COUNT(*) FILTER (WHERE ${MESSAGE_EVENT_FILTER} AND status = 'SUCCESS') AS used_messages
+        COALESCE(SUM(total_tokens) FILTER (WHERE status = 'SUCCESS' AND quota_source = 'RECURRING'), 0) AS used_tokens,
+        COUNT(*) FILTER (WHERE ${MESSAGE_COUNT_FILTER}) AS used_messages
       FROM llm_usage_events
-      WHERE status = 'SUCCESS'
-        AND quota_source = 'RECURRING'
+      WHERE (status = 'PENDING' OR (status = 'SUCCESS' AND quota_source = 'RECURRING'))
         AND created_at >= $2
         AND created_at < $3
         AND ${scopeCompany
@@ -257,14 +300,17 @@ async function getUserQuotaSummary(userId) {
   const hasMessageQuota = planMessages !== null || messageBundles.length > 0;
 
   const remainingPlanMessages = planMessages !== null ? Math.max(0, planMessages - usedMessages) : 0;
-  // Messages beyond the plan consume message bundles, earliest expiry first
-  let overage = planMessages !== null ? Math.max(0, usedMessages - planMessages) : usedMessages;
+  // A plan that defines a message cap is a hard ceiling: message bundles are a
+  // top-up lever for plans without one and must not extend a priced allowance.
   let remainingBundleMessages = 0;
-  for (const b of messageBundles) {
-    const has = Number(b.quota_messages);
-    const consumed = Math.min(has, overage);
-    overage -= consumed;
-    remainingBundleMessages += has - consumed;
+  if (planMessages === null) {
+    let overage = usedMessages;
+    for (const b of messageBundles) {
+      const has = Number(b.quota_messages);
+      const consumed = Math.min(has, overage);
+      overage -= consumed;
+      remainingBundleMessages += has - consumed;
+    }
   }
   const totalRemainingMessages = remainingPlanMessages + remainingBundleMessages;
 

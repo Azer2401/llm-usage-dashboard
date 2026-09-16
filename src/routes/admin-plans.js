@@ -8,17 +8,30 @@ const router = Router();
 router.use(requireAuth, requireAdmin);
 
 // ─── Plan member cap ──────────────────────────────────────────────────────────
-// The cap counts AITM `employees` rows — true company headcount — not
-// llm_user_mappings, which only covers agent-enabled members. max_members of
-// NULL means unlimited, matching the "0 or NULL = not configured" convention
-// already used for llm_service_registry cost limits.
-
-async function getCompanyHeadcount(companyId) {
-  const { rows } = await aitmPool.query(
-    `SELECT COUNT(*)::int AS headcount FROM employees WHERE company_id = $1`,
-    [companyId]
-  );
-  return rows[0].headcount;
+/**
+ * Auto-scale seats down to the plan cap: when a company holds more allocated
+ * seats than max_members, revoke the NEWEST allocations (oldest seats are
+ * kept) until the company sits exactly at the cap. Revoked members fall back
+ * to their standalone Demo Trial quota. Every revocation is audit-logged.
+ * `q` is any queryable (pool or open transaction).
+ */
+async function trimCompanySeatsToCap(q, companyId, maxSeats, actorUserId) {
+  if (maxSeats === null || maxSeats === undefined) return [];
+  const { rows: excess } = await q.query(`
+    SELECT user_id FROM llm_user_mappings
+    WHERE company_id = $1
+    ORDER BY created_at ASC, id ASC
+    OFFSET $2
+  `, [companyId, Number(maxSeats)]);
+  const revoked = [];
+  for (const r of excess) {
+    await q.query(`DELETE FROM llm_user_mappings WHERE user_id = $1 AND company_id = $2`, [r.user_id, companyId]);
+    await q.query(`INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'company.seat_revoked', 'llm_user_mapping', $2, $3, NOW())`,
+      [actorUserId, r.user_id, JSON.stringify({ userId: r.user_id, companyId, reason: 'AUTO_TRIM_SEAT_CAP' })]);
+    revoked.push(r.user_id);
+  }
+  return revoked;
 }
 
 async function getActiveCompanyPlan(companyId) {
@@ -44,23 +57,29 @@ async function getUserCompanyId(userId) {
 }
 
 /**
- * Returns null when the company fits under the plan cap, otherwise the reason
- * payload for a 409. Headcount equal to the cap is allowed; only strictly over
- * is blocked, so a company sitting exactly at its tier keeps working.
+ * Returns null when the company fits under the plan's seat cap, otherwise the
+ * reason payload for a 409. The cap counts **allocated seats**
+ * (llm_user_mappings), not headcount: a company may buy a 5-seat plan for a
+ * 13-person staff — only seat allocation is gated. Seats equal to the cap are
+ * allowed; only strictly over is blocked.
  */
-async function checkMemberCap(companyId, plan) {
+async function checkSeatCap(companyId, plan) {
   const maxMembers = plan && plan.max_members !== null && plan.max_members !== undefined
     ? Number(plan.max_members)
     : null;
   if (!maxMembers || maxMembers <= 0) return null;
 
-  const headcount = await getCompanyHeadcount(companyId);
-  if (headcount <= maxMembers) return null;
+  const { rows } = await dashboardPool.query(
+    `SELECT COUNT(*)::int AS seats FROM llm_user_mappings WHERE company_id = $1`,
+    [companyId],
+  );
+  const seats = rows[0].seats;
+  if (seats < maxMembers) return null;
 
   return {
-    error: `Company has ${headcount} members but plan "${plan.name}" allows ${maxMembers}. Raise the plan cap or assign a larger tier.`,
+    error: `Company already has ${seats} allocated seats and plan "${plan.name}" allows ${maxMembers}. Revoke a seat or assign a larger tier.`,
     code: 'PLAN_MEMBER_CAP_EXCEEDED',
-    headcount,
+    headcount: seats,
     maxMembers,
     planName: plan.name,
   };
@@ -205,6 +224,7 @@ router.patch('/plans/:id', async (req, res) => {
     }
 
     // same for max_members — clearing the cap back to unlimited must be possible
+    let trimmedSeats = [];
     if ('maxMembers' in req.body) {
       if (maxMembers !== null && maxMembers !== undefined && maxMembers <= 0) {
         await client.query('ROLLBACK');
@@ -213,6 +233,19 @@ router.patch('/plans/:id', async (req, res) => {
       rows = (await client.query(`
         UPDATE llm_token_plans SET max_members = $1, updated_at = NOW() WHERE id = $2 RETURNING *
       `, [maxMembers ?? null, id])).rows;
+
+      // Lowering the cap auto-scales every company on this plan down to it
+      // (newest seats revoked first); raising it or clearing it revokes nothing.
+      if (maxMembers !== null && maxMembers !== undefined) {
+        const { rows: cos } = await client.query(`
+          SELECT DISTINCT company_id FROM llm_plan_assignments
+          WHERE plan_id = $1 AND is_active = true AND company_id IS NOT NULL
+        `, [id]);
+        for (const c of cos) {
+          const revoked = await trimCompanySeatsToCap(client, c.company_id, Number(maxMembers), req.user.id);
+          if (revoked.length > 0) trimmedSeats.push({ companyId: c.company_id, revokedUserIds: revoked });
+        }
+      }
     }
 
     if (services && Array.isArray(services)) {
@@ -230,7 +263,7 @@ router.patch('/plans/:id', async (req, res) => {
       [req.user.id, id, JSON.stringify(rows[0])]);
 
     await client.query('COMMIT');
-    res.json(rows[0]);
+    res.json({ ...rows[0], trimmedSeats });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -275,14 +308,10 @@ router.post('/assignments', async (req, res) => {
     if (planRes.rows.length === 0) return res.status(400).json({ error: 'Plan not found or inactive' });
     const plan = planRes.rows[0];
 
-    // Cap check runs BEFORE the previous assignment is deactivated: this route is
-    // not transactional, so blocking after that point would leave the company
-    // with no active plan at all.
-    const capCompanyId = companyId || (userId ? await getUserCompanyId(userId) : null);
-    if (capCompanyId) {
-      const capViolation = await checkMemberCap(capCompanyId, plan);
-      if (capViolation) return res.status(409).json(capViolation);
-    }
+    // No headcount/seat gate here: buying a capped plan for a larger company is
+    // valid — the seat cap is enforced when seats are allocated (POST
+    // /company/:id/plan-seats and PATCH /mappings/:userId/company). Existing
+    // seats above a new cap stay grandfathered until revoked.
 
     if (userId) {
       await dashboardPool.query(`UPDATE llm_plan_assignments SET is_active = false, ended_at = NOW(), updated_at = NOW() WHERE user_id = $1 AND is_active = true`, [userId]);
@@ -305,7 +334,19 @@ router.post('/assignments', async (req, res) => {
       VALUES (gen_random_uuid(), $1, 'plan.assign', 'llm_plan_assignment', $2, $3, NOW())`,
       [req.user.id, rows[0].id, JSON.stringify({ userId, companyId, planId, quotaType: plan.quota_type })]);
 
-    res.status(201).json({ ...rows[0], planName: plan.name, quotaType: plan.quota_type, quotaTokens: Number(plan.quota_tokens) });
+    // Auto-scale: a company switching onto a capped plan keeps only its oldest
+    // max_members seats; the newest excess allocations are revoked.
+    let trimmedSeats = [];
+    if (companyId) {
+      trimmedSeats = await trimCompanySeatsToCap(
+        dashboardPool,
+        companyId,
+        plan.max_members !== null && plan.max_members !== undefined ? Number(plan.max_members) : null,
+        req.user.id,
+      );
+    }
+
+    res.status(201).json({ ...rows[0], planName: plan.name, quotaType: plan.quota_type, quotaTokens: Number(plan.quota_tokens), trimmedSeats });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -408,7 +449,7 @@ router.get('/bundles', async (req, res) => {
     let userMap = {};
     if (userIds.length > 0) {
       const { rows: uRows } = await aitmPool.query(`
-        SELECT id, name, email FROM users WHERE id = ANY($1::uuid[])
+        SELECT id, name, email FROM users WHERE id = ANY($1::text[])
       `, [userIds]);
       for (const u of uRows) {
         userMap[u.id] = u;
@@ -761,6 +802,7 @@ router.get('/aitm-companies', async (req, res) => {
 
     const companyIds = rows.map(r => r.id);
     let planMap = {};
+    let seatMap = {};
     if (companyIds.length > 0) {
       const { rows: plans } = await dashboardPool.query(`
         SELECT a.id AS assignment_id, a.company_id, p.name AS plan_name, p.quota_type,
@@ -770,6 +812,13 @@ router.get('/aitm-companies', async (req, res) => {
         WHERE a.company_id = ANY($1) AND a.is_active = true
       `, [companyIds]);
       for (const p of plans) planMap[p.company_id] = p;
+      const { rows: seatRows } = await dashboardPool.query(`
+        SELECT company_id, COUNT(*)::int AS seat_count
+        FROM llm_user_mappings
+        WHERE company_id = ANY($1)
+        GROUP BY company_id
+      `, [companyIds]);
+      for (const s of seatRows) seatMap[s.company_id] = s.seat_count;
     }
 
     res.json({
@@ -780,6 +829,7 @@ router.get('/aitm-companies', async (req, res) => {
         hrAdminName: r.hr_admin_name,
         hrAdminEmail: r.hr_admin_email,
         memberCount: Number(r.member_count),
+        seatsAllocated: seatMap[r.id] || 0,
         activePlan: planMap[r.id] ? {
           assignmentId: planMap[r.id].assignment_id,
           name: planMap[r.id].plan_name,
@@ -787,10 +837,10 @@ router.get('/aitm-companies', async (req, res) => {
           quotaTokens: Number(planMap[r.id].quota_tokens),
           quotaMessages: planMap[r.id].quota_messages !== null ? Number(planMap[r.id].quota_messages) : null,
           maxMembers: planMap[r.id].max_members !== null ? Number(planMap[r.id].max_members) : null,
-          // member_count is AITM headcount — the same basis the cap is enforced on.
-          // Sitting exactly at the cap is still within tier.
+          // The cap counts allocated seats, not headcount: a company may employ
+          // more people than it bought seats for; only seat allocation is gated.
           overMemberCap: planMap[r.id].max_members !== null
-            && Number(r.member_count) > Number(planMap[r.id].max_members),
+            && (seatMap[r.id] || 0) > Number(planMap[r.id].max_members),
           startsAt: planMap[r.id].starts_at,
           resetAt: planMap[r.id].reset_at,
         } : null,
@@ -846,12 +896,13 @@ router.patch('/mappings/:userId/company', async (req, res) => {
     const { userId } = req.params;
     const { companyId } = req.body;
 
-    // Moving a member into a company already over its plan cap would grant agent
-    // access the tier does not cover, so block before touching the mapping.
+    // Moving a member into a company whose seats are already at the plan cap
+    // would grant agent access the tier does not cover, so block before
+    // touching the mapping.
     if (companyId) {
       const plan = await getActiveCompanyPlan(companyId);
       if (plan) {
-        const capViolation = await checkMemberCap(companyId, plan);
+        const capViolation = await checkSeatCap(companyId, plan);
         if (capViolation) return res.status(409).json(capViolation);
       }
     }

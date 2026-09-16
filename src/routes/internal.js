@@ -100,7 +100,7 @@ router.post('/events', async (req, res) => {
     } = req.body;
 
     if (!userId || !status) return res.status(400).json({ error: 'userId and status required' });
-    if (!['SUCCESS', 'FAILED', 'REJECTED'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    if (!['SUCCESS', 'FAILED', 'REJECTED', 'PENDING'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
     // Idempotency check
     if (requestId) {
@@ -201,8 +201,13 @@ router.post('/quota-summary', async (req, res) => {
     const isHrAdmin = !!(company && company.hrAdminId === userId);
 
     let memberCount = 0;
+    let seatsAllocated = 0;
     let members = null;
     if (company) {
+      const sRes = await dashboardPool.query(`
+        SELECT COUNT(*)::int AS seats FROM llm_user_mappings WHERE company_id = $1
+      `, [company.id]);
+      seatsAllocated = sRes.rows[0].seats;
       const mRes = await aitmPool.query(`
         SELECT u.id AS user_id, u.name, u.email, ur.role_name AS role
         FROM employees e
@@ -221,9 +226,8 @@ router.post('/quota-summary', async (req, res) => {
             SELECT user_id, COUNT(*) AS used_messages
             FROM llm_usage_events
             WHERE user_id = ANY($1)
-              AND status = 'SUCCESS'
-              AND source_service = 'GOCLAW'
               AND feature_name = 'goclaw_chat'
+              AND (status = 'SUCCESS' OR status = 'PENDING')
               AND created_at >= $2 AND created_at < $3
             GROUP BY user_id
           `, [ids, periodStart, periodEnd]);
@@ -266,7 +270,7 @@ router.post('/quota-summary', async (req, res) => {
         quotaTokens:   Number(summary.assignment.quota_tokens),
         maxMembers:    summary.assignment.max_members !== null && summary.assignment.max_members !== undefined ? Number(summary.assignment.max_members) : null,
         overMemberCap: summary.assignment.max_members !== null && summary.assignment.max_members !== undefined
-          ? memberCount > Number(summary.assignment.max_members)
+          ? seatsAllocated > Number(summary.assignment.max_members)
           : false,
         startsAt:      summary.assignment.starts_at,
         resetAt:       summary.assignment.reset_at,
@@ -294,45 +298,12 @@ router.post('/quota-summary', async (req, res) => {
         name: company.name,
         isHrAdmin,
         memberCount,
+        seatsAllocated,
         members,
       } : null,
     });
   } catch (err) {
     console.error('[Internal] POST /quota-summary error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── POST /api/internal/company-cap ─────────────────────────────────────────
-// Headcount against the active plan's member cap, so the AITM backend can
-// enforce the cap when an HR admin adds a member. The cap is otherwise only
-// checked on plan assignment / member mapping.
-router.post('/company-cap', async (req, res) => {
-  try {
-    const { companyId } = req.body;
-    if (!companyId) return res.status(400).json({ error: 'companyId required' });
-
-    const [mRes, pRes] = await Promise.all([
-      aitmPool.query(`SELECT COUNT(*)::int AS member_count FROM employees WHERE company_id = $1`, [companyId]),
-      dashboardPool.query(`
-        SELECT p.max_members
-        FROM llm_plan_assignments a
-        JOIN llm_token_plans p ON p.id = a.plan_id
-        WHERE a.company_id = $1 AND a.is_active = true
-        LIMIT 1
-      `, [companyId]),
-    ]);
-    const raw = pRes.rows[0] ? pRes.rows[0].max_members : null;
-    const maxMembers = raw !== null && raw !== undefined ? Number(raw) : null;
-    const memberCount = mRes.rows[0].member_count;
-    res.json({
-      companyId,
-      memberCount,
-      maxMembers,
-      overMemberCap: maxMembers !== null && memberCount > maxMembers,
-    });
-  } catch (err) {
-    console.error('[Internal] POST /company-cap error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -427,4 +398,191 @@ router.put('/company-limits', async (req, res) => {
   }
 });
 
+// ─── Plan Seat Allocation Endpoints ──────────────────────────────────────────
+// GET /api/internal/company/:companyId/plan-seats
+router.get('/company/:companyId/plan-seats', async (req, res) => {
+  try {
+    const { companyId } = req.params;
+    if (!companyId) return res.status(400).json({ error: 'companyId required' });
+
+    // 1. Get active company plan
+    const planRes = await dashboardPool.query(`
+      SELECT p.id, p.name, p.max_members, p.quota_messages, p.quota_tokens, p.quota_type,
+             a.id AS assignment_id, a.starts_at, a.reset_at
+      FROM llm_plan_assignments a
+      JOIN llm_token_plans p ON p.id = a.plan_id
+      WHERE a.company_id = $1 AND a.is_active = true
+      ORDER BY a.created_at DESC LIMIT 1
+    `, [companyId]);
+    const planRow = planRes.rows[0] || null;
+
+    // 2. Get allocated members from llm_user_mappings
+    const seatRes = await dashboardPool.query(`
+      SELECT user_id, created_at AS allocated_at, updated_at
+      FROM llm_user_mappings
+      WHERE company_id = $1
+      ORDER BY created_at ASC
+    `, [companyId]);
+    const allocatedRows = seatRes.rows;
+    const userIds = allocatedRows.map(r => r.user_id);
+
+    // 3. Resolve user details from AITM
+    let userDetailsMap = {};
+    if (userIds.length > 0) {
+      try {
+        const aitmRes = await aitmPool.query(`
+          SELECT u.id AS user_id, u.name, u.email, ur.role_name AS role
+          FROM users u
+          LEFT JOIN employees e ON e.user_id = u.id
+          LEFT JOIN user_roles ur ON ur.id = e.user_role_id
+          WHERE u.id = ANY($1)
+        `, [userIds]);
+        for (const u of aitmRes.rows) userDetailsMap[u.user_id] = u;
+      } catch (aitmErr) {
+        console.warn('[Internal] Could not resolve AITM user details:', aitmErr.message);
+      }
+    }
+
+    // 4. Resolve message usage per user in current period
+    let usageMap = {};
+    if (userIds.length > 0 && planRow?.starts_at && planRow?.reset_at) {
+      try {
+        const usageRes = await dashboardPool.query(`
+          SELECT user_id, COUNT(*)::int AS used_messages
+          FROM llm_usage_events
+          WHERE source_service = 'GOCLAW' AND feature_name = 'goclaw_chat' AND status = 'SUCCESS'
+            AND created_at >= $1 AND created_at < $2
+            AND user_id = ANY($3)
+          GROUP BY user_id
+        `, [planRow.starts_at, planRow.reset_at, userIds]);
+        for (const u of usageRes.rows) usageMap[u.user_id] = u.used_messages;
+      } catch (usageErr) {
+        console.warn('[Internal] Could not resolve user message usage:', usageErr.message);
+      }
+    }
+
+    const maxSeats = planRow?.max_members !== null && planRow?.max_members !== undefined
+      ? Number(planRow.max_members)
+      : null;
+    const seatsUsed = allocatedRows.length;
+    const canAddMember = maxSeats === null || seatsUsed < maxSeats;
+
+    const allocatedMembers = allocatedRows.map(r => {
+      const u = userDetailsMap[r.user_id];
+      return {
+        userId: r.user_id,
+        name: u?.name || 'Unknown User',
+        email: u?.email || '',
+        role: u?.role || 'MEMBER',
+        allocatedAt: r.allocated_at,
+        usedMessages: usageMap[r.user_id] || 0,
+      };
+    });
+
+    res.json({
+      companyId,
+      // Field names are the AITM frontend's PlanSeatsData contract; the
+      // seatsUsed/maxSeats/canAddMember aliases are kept for older callers.
+      planName: planRow ? planRow.name : null,
+      maxMembers: maxSeats,
+      seatsAllocated: seatsUsed,
+      availableSeats: maxSeats === null ? null : Math.max(0, maxSeats - seatsUsed),
+      canAllocateMore: canAddMember,
+      plan: planRow ? {
+        id: planRow.id,
+        name: planRow.name,
+        maxMembers: maxSeats,
+        quotaMessages: planRow.quota_messages !== null ? Number(planRow.quota_messages) : null,
+        quotaTokens: Number(planRow.quota_tokens),
+        quotaType: planRow.quota_type,
+      } : null,
+      seatsUsed,
+      maxSeats,
+      canAddMember,
+      allocatedMembers,
+    });
+  } catch (err) {
+    console.error('[Internal] GET /company/:companyId/plan-seats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/internal/company/:companyId/plan-seats
+router.post('/company/:companyId/plan-seats', async (req, res) => {
+  try {
+    const { companyId } = req.params;
+    const { userId, actorUserId } = req.body;
+    if (!companyId || !userId) return res.status(400).json({ error: 'companyId and userId required' });
+
+    // 1. Check company plan and member cap
+    const planRes = await dashboardPool.query(`
+      SELECT p.id, p.name, p.max_members
+      FROM llm_plan_assignments a
+      JOIN llm_token_plans p ON p.id = a.plan_id
+      WHERE a.company_id = $1 AND a.is_active = true
+      ORDER BY a.created_at DESC LIMIT 1
+    `, [companyId]);
+    const plan = planRes.rows[0] || null;
+
+    if (plan && plan.max_members !== null && plan.max_members !== undefined) {
+      const { rows: currentSeats } = await dashboardPool.query(
+        `SELECT COUNT(*)::int AS count FROM llm_user_mappings WHERE company_id = $1`,
+        [companyId]
+      );
+      if (currentSeats[0].count >= Number(plan.max_members)) {
+        return res.status(409).json({
+          error: 'PLAN_SEAT_LIMIT_REACHED',
+          message: `Kapasitas kursi AI plan telah penuh (${currentSeats[0].count}/${plan.max_members}). Cabut kursi anggota lain atau upgrade plan.`,
+          seatsUsed: currentSeats[0].count,
+          maxSeats: Number(plan.max_members),
+        });
+      }
+    }
+
+    // 2. Upsert into llm_user_mappings
+    const { rows } = await dashboardPool.query(`
+      INSERT INTO llm_user_mappings (id, user_id, company_id, created_at, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
+      ON CONFLICT (user_id) DO UPDATE SET company_id = $2, updated_at = NOW()
+      RETURNING *
+    `, [userId, companyId]);
+
+    // 3. Record audit log
+    await dashboardPool.query(`
+      INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'company.seat_allocated', 'llm_user_mapping', $2, $3, NOW())
+    `, [actorUserId || 'system', userId, JSON.stringify({ userId, companyId })]);
+
+    res.json({ success: true, mapping: rows[0] });
+  } catch (err) {
+    console.error('[Internal] POST /company/:companyId/plan-seats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/internal/company/:companyId/plan-seats/:userId
+router.delete('/company/:companyId/plan-seats/:userId', async (req, res) => {
+  try {
+    const { companyId, userId } = req.params;
+    const { actorUserId } = req.body || {};
+    if (!companyId || !userId) return res.status(400).json({ error: 'companyId and userId required' });
+
+    await dashboardPool.query(`
+      UPDATE llm_user_mappings SET company_id = NULL, updated_at = NOW()
+      WHERE user_id = $1 AND company_id = $2
+    `, [userId, companyId]);
+
+    await dashboardPool.query(`
+      INSERT INTO llm_audit_logs (id, actor_user_id, action, target_type, target_id, after_json, created_at)
+      VALUES (gen_random_uuid(), $1, 'company.seat_revoked', 'llm_user_mapping', $2, $3, NOW())
+    `, [actorUserId || 'system', userId, JSON.stringify({ userId, companyId })]);
+
+    res.json({ success: true, message: 'Plan seat revoked successfully' });
+  } catch (err) {
+    console.error('[Internal] DELETE /company/:companyId/plan-seats/:userId error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
+

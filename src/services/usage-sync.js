@@ -195,6 +195,15 @@ async function syncGoclawTraces() {
     // Collect trace IDs for span sync
     const traceIdsForSpans = [];
 
+    // Request ids already imported: PENDING chat markers must only be consumed
+    // for traces that are NEW in this tick, otherwise re-upserting old traces
+    // would eat markers belonging to fresh sends.
+    const { rows: existingRows } = await dashboardPool.query(`
+      SELECT request_id FROM llm_usage_events WHERE request_id = ANY($1)
+    `, [traces.map(t => `trace:${t.execution_id}`)]);
+    const existingRequestIds = new Set(existingRows.map(r => r.request_id));
+    const newChatPerUser = {};
+
     for (const trace of traces) {
       const userId = senderToUser[trace.goclaw_sender_id];
       if (!userId) {
@@ -268,11 +277,37 @@ async function syncGoclawTraces() {
         ]);
         synced++;
         traceIdsForSpans.push({ traceId: trace.execution_id, userId, createdAt: trace.created_at });
+        if (!existingRequestIds.has(requestId)) {
+          newChatPerUser[userId] = (newChatPerUser[userId] || 0) + 1;
+        }
       } catch (err) {
         console.error('[Sync] Insert trace error:', err.message);
         skipped++;
       }
     }
+
+    // Consume one PENDING chat marker per newly imported trace (FIFO, per user):
+    // from now on the SUCCESS row carries the count, so the marker must go or
+    // the message would be counted twice.
+    for (const [markerUserId, count] of Object.entries(newChatPerUser)) {
+      await dashboardPool.query(`
+        DELETE FROM llm_usage_events
+        WHERE id IN (
+          SELECT id FROM llm_usage_events
+          WHERE user_id = $1 AND status = 'PENDING' AND feature_name = 'goclaw_chat'
+          ORDER BY created_at ASC
+          LIMIT $2
+        )
+      `, [markerUserId, count]);
+    }
+    // Safety valve: a marker whose trace never lands (crashed agent run) must
+    // not keep blocking the member forever.
+    await dashboardPool.query(`
+      DELETE FROM llm_usage_events
+      WHERE status = 'PENDING'
+        AND feature_name = 'goclaw_chat'
+        AND created_at < NOW() - interval '5 minutes'
+    `);
 
     // ── Sync individual spans (tool_call + llm_call) for mapped traces ──
     if (traceIdsForSpans.length > 0) {

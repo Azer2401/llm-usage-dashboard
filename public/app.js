@@ -686,6 +686,20 @@ pages.users = async function() {
     quotaType = document.getElementById('user-quota-type').value;
     skip = 0; loadUsers();
   });
+  // Live search while typing (debounced); the closure-held `search` also keeps
+  // the filter applied across 15s live-refresh ticks.
+  let userSearchDebounce = null;
+  document.getElementById('user-search').addEventListener('input', () => {
+    clearTimeout(userSearchDebounce);
+    userSearchDebounce = setTimeout(() => {
+      search = document.getElementById('user-search').value;
+      skip = 0; loadUsers();
+    }, 300);
+  });
+  document.getElementById('user-quota-type').addEventListener('change', () => {
+    quotaType = document.getElementById('user-quota-type').value;
+    skip = 0; loadUsers();
+  });
   pages.users.refresh = loadUsers;
   loadUsers();
 };

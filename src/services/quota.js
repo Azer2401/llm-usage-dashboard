@@ -300,17 +300,18 @@ async function getUserQuotaSummary(userId) {
   const hasMessageQuota = planMessages !== null || messageBundles.length > 0;
 
   const remainingPlanMessages = planMessages !== null ? Math.max(0, planMessages - usedMessages) : 0;
-  // A plan that defines a message cap is a hard ceiling: message bundles are a
-  // top-up lever for plans without one and must not extend a priced allowance.
+  // Messages beyond the plan consume message bundles, earliest expiry first.
+  // Bundles are the extension lever: demo top-ups when a trial user asks for
+  // more messages, and paid extra messages on capped plans. QA cap tests must
+  // revoke bundles first (see PRD preconditions) — the chip surfaces active
+  // top-ups as "+N bundle" so a cap plus bundle is never silent.
+  let overage = planMessages !== null ? Math.max(0, usedMessages - planMessages) : usedMessages;
   let remainingBundleMessages = 0;
-  if (planMessages === null) {
-    let overage = usedMessages;
-    for (const b of messageBundles) {
-      const has = Number(b.quota_messages);
-      const consumed = Math.min(has, overage);
-      overage -= consumed;
-      remainingBundleMessages += has - consumed;
-    }
+  for (const b of messageBundles) {
+    const has = Number(b.quota_messages);
+    const consumed = Math.min(has, overage);
+    overage -= consumed;
+    remainingBundleMessages += has - consumed;
   }
   const totalRemainingMessages = remainingPlanMessages + remainingBundleMessages;
 
